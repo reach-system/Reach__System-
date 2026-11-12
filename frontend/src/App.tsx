@@ -24,6 +24,7 @@ import {
   CustomerReportPage,
   SupplierReportPage,
   InventoryReportPage,
+  QuotationsReportPage,
 } from "./features/reports";
 import AdminAttendance from "./pages/admin/Attendance";
 import AdminSettings from "./pages/admin/Settings";
@@ -34,9 +35,13 @@ import NewInvoice from "./pages/sales/NewInvoice";
 import InvoiceSearch from "./pages/sales/InvoiceSearch";
 import InvoiceDetail from "./pages/sales/InvoiceDetail";
 import Customers from "./pages/sales/Customers";
+import Quotations from "./pages/sales/Quotations";
+import QuotationForm from "./pages/sales/QuotationForm";
+import QuotationDetail from "./pages/sales/QuotationDetail";
 import MyRequests from "./pages/sales/MyRequests";
 import NewChangeRequest from "./pages/sales/NewChangeRequest";
 import SalesAttendance from "./pages/sales/Attendance";
+import LastPricesPage from "./pages/shared/LastPrices";
 import InventoryHome from "./pages/inventory/Home";
 import ReceiveShipment from "./pages/inventory/ReceiveShipment";
 import Stock from "./pages/inventory/Stock";
@@ -157,7 +162,12 @@ export default function App() {
                     <Route path="new-invoice" element={<NewInvoice />} />
                     <Route path="invoice-search" element={<InvoiceSearch />} />
                     <Route path="invoice/:id" element={<InvoiceDetail />} />
+                    <Route path="quotations" element={<Quotations />} />
+                    <Route path="quotations/new" element={<QuotationForm />} />
+                    <Route path="quotations/:id" element={<QuotationDetail />} />
+                    <Route path="quotations/:id/edit" element={<QuotationForm />} />
                     <Route path="customers" element={<Customers />} />
+                    <Route path="last-prices" element={<LastPricesPage />} />
                     <Route path="my-requests" element={<MyRequests />} />
                     <Route path="change-request" element={<NewChangeRequest />} />
                     <Route path="change-request/:invoiceId" element={<NewChangeRequest />} />
@@ -213,14 +223,20 @@ export default function App() {
                     <Route path="invoices" element={<AdminInvoices />} />
                     <Route path="new-invoice" element={<NewInvoice />} />
                     <Route path="invoices/:id" element={<AdminInvoiceDetail />} />
+                    <Route path="quotations" element={<Quotations />} />
+                    <Route path="quotations/new" element={<QuotationForm />} />
+                    <Route path="quotations/:id" element={<QuotationDetail />} />
+                    <Route path="quotations/:id/edit" element={<QuotationForm />} />
                     <Route path="employees" element={<AdminEmployees />} />
                     <Route path="attendance" element={<AdminAttendance />} />
                     <Route path="expenses" element={<AdminExpenses />} />
                     <Route path="suppliers" element={<AdminSuppliers />} />
                     <Route path="customers" element={<AdminCustomers />} />
                     <Route path="customer-debts" element={<AdminCustomerDebts />} />
+                    <Route path="last-prices" element={<LastPricesPage />} />
                  <Route path="unit-search" element={<UnitSearch />} />
                     <Route path="stock-pricing" element={<PendingPricingQueue />} />
+                    <Route path="delivery" element={<InvoiceDelivery />} />
                     <Route path="stock-adjustments" element={<StockAdjustments />} />
                     <Route path="reports" element={<ReportsLayout />}>
                       <Route index element={<ReportsIndexPage />} />
@@ -233,6 +249,7 @@ export default function App() {
                       <Route path="customers" element={<CustomerReportPage />} />
                       <Route path="suppliers" element={<SupplierReportPage />} />
                       <Route path="inventory" element={<InventoryReportPage />} />
+                      <Route path="quotations" element={<QuotationsReportPage />} />
                     </Route>
                     <Route path="audit" element={<AdminAuditHistory />} />
                     <Route path="settings" element={<AdminSettings />} />

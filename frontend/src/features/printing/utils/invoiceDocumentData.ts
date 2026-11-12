@@ -9,6 +9,10 @@ import type {
   InvoiceDocumentData,
   InvoiceDocumentLine,
 } from "../components/InvoiceDocument";
+import {
+  calculateInvoiceDocumentTotals,
+  getEffectivePrice,
+} from "../../../lib/invoiceTotals";
 function toDocumentLine(item: InvoiceItem): InvoiceDocumentLine {
   const assignedBarcodes = (item.unitAssignments ?? [])
     .filter(
@@ -29,7 +33,7 @@ function toDocumentLine(item: InvoiceItem): InvoiceDocumentLine {
     barcode: assignedBarcodes.length
       ? assignedBarcodes.join(", ")
       : item.productUnit?.barcode,
-    price: Number(item.price ?? 0),
+    price: getEffectivePrice(item),
   };
 }
 
@@ -47,6 +51,18 @@ export function createInvoiceDocumentData(
     timestamp: entry.timestamp,
   }));
 
+  // The visible lines use effective (post-adjustment) prices, so the document
+  // subtotal must be rebuilt from them instead of the creation-time snapshot.
+  const documentTotals = calculateInvoiceDocumentTotals(
+    invoice.items.map((item) => ({
+      price: getEffectivePrice(item),
+      quantity: Number(item.quantity ?? 1),
+    })),
+    Number(invoice.originalTotal ?? 0),
+    Number(invoice.discountPercentage ?? 0),
+    Number(invoice.discountAmount ?? 0),
+  );
+
   return {
     invoiceNumber: invoice.invoiceNumber,
     date: invoice.date,
@@ -57,10 +73,11 @@ export function createInvoiceDocumentData(
     statusLabel: translateStatus(invoice.status),
     paymentType: invoice.paymentType,
     note: invoice.note,
-    originalTotal: invoice.originalTotal,
+    originalTotal: documentTotals.subtotal,
     currentTotal: invoice.currentTotal,
     discountPercentage: invoice.discountPercentage,
-    discountAmount: invoice.discountAmount,
+    discountAmount: documentTotals.fixedDiscount,
+    percentageDiscount: documentTotals.percentageDiscount,
     items: invoice.items.map(toDocumentLine),
     auditEntries,
     printedAt,

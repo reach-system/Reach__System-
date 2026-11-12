@@ -1,0 +1,16 @@
+package-lock.json|Generated lockfile; dependency versions recorded in package.json and reviewed for vulnerability listing only
+backend/package-lock.json|Generated lockfile; not hand-maintained source
+frontend/package-lock.json|Generated lockfile; not hand-maintained source
+backend/server.err.log|Runtime log artifact, not source code
+backend/server.out.log|Runtime log artifact, not source code
+backend/uploads/057fb367-dd98-4be2-b074-424a3e57b0d8.png|Uploaded binary asset (runtime data)
+backend/uploads/3ba1310c-91d0-424a-b254-40dd51d69298.jpg|Uploaded binary asset (runtime data)
+backend/uploads/bbd27fe8-8528-4b07-a576-e0c22b2b1f38.jpg|Uploaded binary asset (runtime data)
+frontend/src/assets/hero.png|Binary image asset
+frontend/src/assets/react.svg|Binary/vector asset, no executable logic
+frontend/src/assets/vite.svg|Binary/vector asset, no executable logic
+frontend/public/favicon.svg|Static vector asset, no executable logic
+frontend/public/icons.svg|Static vector sprite, no executable logic
+backend/prisma/legacy/add_role.sql|Superseded legacy copy, byte-identical to backend/prisma/add_role.sql (reviewed there)
+backend/prisma/legacy/constraints.sql|Superseded legacy copy, byte-identical to backend/prisma/constraints.sql (reviewed there)
+backend/prisma/legacy/migration.sql|Superseded legacy migration already captured in prisma/migrations history

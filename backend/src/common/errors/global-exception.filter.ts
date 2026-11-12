@@ -36,6 +36,10 @@ export class GlobalExceptionFilter implements ExceptionFilter {
           : resolved.message,
       code: resolved.code,
       statusCode: resolved.status,
+      // Preserve structured 4xx details (productName/available/requested,
+      // delivery line context, ...) so the client can show a specific message.
+      // 5xx responses never carry throw-site details.
+      ...this.resolveDetails(exception, resolved.status),
     };
 
     if (resolved.status >= 500) {
@@ -79,6 +83,26 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       code: AppErrorCode.INTERNAL_SERVER_ERROR,
       message: ERROR_MESSAGES[AppErrorCode.CONNECTION_ERROR],
     };
+  }
+
+  /**
+   * Keep extra fields a throw site attached to an HttpException payload
+   * (`productName`, `available`, `requested`, `line`, `barcode`, ...) while
+   * dropping the fields the filter owns. Only 4xx responses are eligible so
+   * internal errors cannot leak implementation details.
+   */
+  private resolveDetails(exception: unknown, status: number): Record<string, unknown> {
+    if (status >= 500 || !(exception instanceof HttpException)) {
+      return {};
+    }
+
+    const payload = exception.getResponse();
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return {};
+    }
+
+    const { message, code, statusCode, error, ...details } = payload as Record<string, unknown>;
+    return details;
   }
 
   /**

@@ -2,9 +2,14 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException, 
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeService } from '../realtime/realtime.service';
-import { ProductUnitStatus, Prisma, ChangeRequestStatus, InvoiceAuditAction, ChangeRequestItemAction, Role } from '@prisma/client';
+import { ProductUnitStatus, Prisma, ChangeRequestStatus, InvoiceAuditAction, ChangeRequestItemAction, InvoiceStatus, Role } from '@prisma/client';
 import { CreateInvoiceChangeRequestInput } from './dto/invoice-change-request.types';
 import { normalizeQuantity, roundQuantity } from '../common/quantity.util';
+import {
+  calculateInvoiceDiscountFactor,
+  calculateOutstandingInvoiceTotal,
+  roundMoney,
+} from '../common/invoice-totals.util';
 
 type ChangeRequestWithItems = Prisma.InvoiceChangeRequestGetPayload<{
   include: { items: true; invoice: { include: { items: true } } };
@@ -17,6 +22,22 @@ type ActionGroups = {
   prices: ChangeRequestItemRow[];
   isEmpty: boolean;
 };
+type FinancialLine = {
+  id: number;
+  productModelId: number;
+  modelName: string;
+  quantity: number;
+  returnedQuantity: number;
+  remainingQuantity: number;
+  effectivePrice: number;
+};
+type InvoiceFinancialState = {
+  invoiceId: number;
+  currentTotal: number;
+  discountFactor: number;
+  lines: FinancialLine[];
+  total: number;
+};
 
 @Injectable()
 export class InvoiceChangeRequestsService {
@@ -25,6 +46,193 @@ export class InvoiceChangeRequestsService {
     private notificationsService: NotificationsService,
     private realtimeService?: RealtimeService,
   ) {}
+
+  private async applyInvoiceProductLastPrice(
+    tx: Prisma.TransactionClient,
+    invoiceId: number,
+    productModelId: number,
+    price: number,
+    effectiveAt: Date,
+  ) {
+    const normalized = Number(price);
+    if (!Number.isFinite(normalized) || normalized < 0) {
+      return;
+    }
+
+    const existing = await tx.productLastPrice.findUnique({ where: { productModelId } });
+    if (!existing) {
+      await tx.productLastPrice.create({
+        data: {
+          productModelId,
+          price: normalized,
+          source: 'INVOICE',
+          sourceInvoiceId: invoiceId,
+          effectiveAt,
+          version: 1,
+        },
+      });
+      return;
+    }
+
+    if (existing.effectiveAt.getTime() > effectiveAt.getTime()) {
+      return;
+    }
+
+    await tx.productLastPrice.update({
+      where: { productModelId },
+      data: {
+        price: normalized,
+        source: 'INVOICE',
+        sourceInvoiceId: invoiceId,
+        effectiveAt,
+        updatedByEmployeeId: null,
+        version: { increment: 1 },
+      },
+    });
+  }
+
+  /**
+   * Authoritative financial snapshot for an invoice.
+   *
+   * Everything is derived from persisted state:
+   *   - effective unit price = latest approved price adjustment (or item.price)
+   *   - remaining quantity   = sold quantity − approved returns
+   *   - discount factor      = snapshot taken from the invoice's original terms
+   *
+   * `currentTotal` is therefore never patched by deltas; it is recomputed from
+   * this snapshot after every mutation. This is what makes a price change apply
+   * to the whole outstanding quantity instead of a single unit.
+   */
+  private async computeInvoiceFinancialState(
+    tx: Prisma.TransactionClient,
+    invoiceId: number,
+  ): Promise<InvoiceFinancialState> {
+    const invoice = await tx.invoice.findUnique({
+      where: { id: invoiceId },
+      select: {
+        id: true,
+        originalTotal: true,
+        currentTotal: true,
+        discountPercentage: true,
+        discountAmount: true,
+        items: {
+          select: {
+            id: true,
+            productModelId: true,
+            quantity: true,
+            price: true,
+            productModel: { select: { name: true } },
+            priceAdjustments: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+              select: { newPrice: true },
+            },
+          },
+        },
+        returns: {
+          select: {
+            items: { select: { invoiceItemId: true, quantity: true } },
+          },
+        },
+      },
+    });
+
+    if (!invoice) {
+      throw new NotFoundException({ code: 'INVOICE_NOT_FOUND', message: 'Invoice not found' });
+    }
+
+    const returnedByItem = new Map<number, number>();
+    for (const invoiceReturn of invoice.returns) {
+      for (const returnItem of invoiceReturn.items) {
+        returnedByItem.set(
+          returnItem.invoiceItemId,
+          roundQuantity((returnedByItem.get(returnItem.invoiceItemId) ?? 0) + Number(returnItem.quantity ?? 1)),
+        );
+      }
+    }
+
+    const discountFactor = calculateInvoiceDiscountFactor(
+      Number(invoice.originalTotal),
+      Number(invoice.discountPercentage ?? 0),
+      Number(invoice.discountAmount ?? 0),
+    );
+
+    const lines: FinancialLine[] = invoice.items.map((item) => {
+      const returnedQuantity = returnedByItem.get(item.id) ?? 0;
+      const remainingQuantity = Math.max(0, roundQuantity(Number(item.quantity) - returnedQuantity));
+      const effectivePrice = roundMoney(
+        item.priceAdjustments.length > 0
+          ? Number(item.priceAdjustments[0].newPrice)
+          : Number(item.price),
+      );
+      return {
+        id: item.id,
+        productModelId: item.productModelId,
+        modelName: item.productModel?.name ?? `item#${item.id}`,
+        quantity: Number(item.quantity),
+        returnedQuantity,
+        remainingQuantity,
+        effectivePrice,
+      };
+    });
+
+    const { total } = calculateOutstandingInvoiceTotal(
+      lines.map((line) => ({ price: line.effectivePrice, quantity: line.remainingQuantity })),
+      discountFactor,
+    );
+
+    return {
+      invoiceId,
+      currentTotal: Number(invoice.currentTotal),
+      discountFactor,
+      lines,
+      total,
+    };
+  }
+
+  /**
+   * Persist the server-computed total with a compare-and-set so a lost update
+   * becomes a visible 409 instead of silently corrupting receivables.
+   */
+  private async recomputeInvoiceTotal(
+    tx: Prisma.TransactionClient,
+    invoiceId: number,
+  ): Promise<InvoiceFinancialState> {
+    const state = await this.computeInvoiceFinancialState(tx, invoiceId);
+    const updated = await tx.invoice.updateMany({
+      where: { id: invoiceId, currentTotal: state.currentTotal },
+      data: { currentTotal: state.total },
+    });
+    if (updated.count !== 1) {
+      throw new ConflictException({
+        code: 'INVOICE_CONCURRENTLY_MODIFIED',
+        message: 'This invoice was changed by another user. Reload it and try again.',
+      });
+    }
+
+    // A full return leaves no outstanding quantity on any line: close the
+    // invoice so it is no longer treated as an active sale and rejects further
+    // change requests.
+    if (state.lines.length > 0 && state.lines.every((line) => line.remainingQuantity <= 0)) {
+      await tx.invoice.update({
+        where: { id: invoiceId },
+        data: { status: InvoiceStatus.CANCELLED },
+      });
+    }
+
+    return state;
+  }
+
+  private getEffectivePrice(item: {
+    price: Prisma.Decimal | number;
+    priceAdjustments?: { newPrice: Prisma.Decimal | number }[];
+  }): number {
+    return roundMoney(
+      item.priceAdjustments && item.priceAdjustments.length > 0
+        ? Number(item.priceAdjustments[0].newPrice)
+        : Number(item.price),
+    );
+  }
 
   private async claimIdempotencyKey(employeeId: number, rawKey: string): Promise<Prisma.JsonValue | null> {
     const key = rawKey.trim();
@@ -121,6 +329,8 @@ export class InvoiceChangeRequestsService {
     const itemsSummary: string[] = [];
     // Running total of non-serialized quantity requested on each line within this request.
     const requestedQtyByInvoiceItem = new Map<number, number>();
+    // One price change per line per request; duplicates would apply twice.
+    const priceChangeTargets = new Set<number>();
     for (const item of data.items) {
       if (item.action === ChangeRequestItemAction.RETURN_ITEM || item.action === ChangeRequestItemAction.REMOVE_ITEM) {
         if (!item.invoiceItemId) {
@@ -154,7 +364,11 @@ export class InvoiceChangeRequestsService {
             });
           }
           const existingReturn = await this.prisma.invoiceReturnItem.findFirst({
-            where: { productUnitId: item.productUnitId },
+            where: {
+              invoiceItemId: item.invoiceItemId,
+              productUnitId: item.productUnitId,
+            },
+            select: { id: true },
           });
           if (existingReturn) {
             throw new BadRequestException({ code: 'UNIT_ALREADY_RETURNED', message: 'This unit has already been returned' });
@@ -248,6 +462,13 @@ export class InvoiceChangeRequestsService {
         if (item.proposedPrice < 0) {
           throw new BadRequestException({ code: 'INVALID_PRICE', message: 'Proposed price must be non-negative' });
         }
+        if (priceChangeTargets.has(item.invoiceItemId)) {
+          throw new BadRequestException({
+            code: 'DUPLICATE_PRICE_CHANGE',
+            message: 'The same invoice line cannot have more than one price change in a request',
+          });
+        }
+        priceChangeTargets.add(item.invoiceItemId);
         const invoiceItem = invoice.items.find((i) => i.id === item.invoiceItemId);
         if (!invoiceItem) {
           throw new BadRequestException({ code: 'INVALID_INVOICE_ITEM', message: `Invoice item ${item.invoiceItemId} does not belong to this invoice` });
@@ -518,7 +739,40 @@ export class InvoiceChangeRequestsService {
         Object.assign(results, await this.applyPriceActions(tx, fresh, adminId, adminNote));
       }
 
-      return results;
+      // An add-only request may have auto-rejected itself without mutating
+      // anything. In that case there is no total to recompute.
+      if (results.status === 'REJECTED') {
+        return results;
+      }
+
+      // Single authoritative write: recompute the total from the persisted
+      // lines, remaining quantities, current prices and invoice discount terms.
+      const finalState = await this.recomputeInvoiceTotal(tx, fresh.invoiceId);
+      const invoice = await tx.invoice.findUnique({
+        where: { id: fresh.invoiceId },
+        include: {
+          customer: { select: { id: true, name: true, type: true, phone: true } },
+          employee: { select: { id: true, name: true } },
+          items: {
+            include: {
+              productModel: { select: { id: true, name: true, isSerialized: true, unit: true } },
+              priceAdjustments: { orderBy: { createdAt: 'desc' } },
+              unitAssignments: {
+                where: { reversedAt: null },
+                include: { productUnit: { select: { id: true, barcode: true, status: true } } },
+              },
+            },
+          },
+          priceAdjustments: { orderBy: { createdAt: 'desc' } },
+          returns: { include: { items: true } },
+        },
+      });
+
+      return {
+        ...results,
+        newTotal: finalState.total,
+        invoice,
+      };
     });
   }
 
@@ -548,6 +802,20 @@ export class InvoiceChangeRequestsService {
     if (claimed.count !== 1) {
       throw new ConflictException({ code: 'CHANGE_REQUEST_ALREADY_REVIEWED', message: 'This request has already been reviewed' });
     }
+
+    // Serialize all invoice mutations for the rest of this transaction. Two
+    // approvals (or an approval racing a return) can otherwise read the same
+    // currentTotal and both write an increment, losing one of the updates.
+    const target = await tx.invoiceChangeRequest.findUnique({
+      where: { id: requestId },
+      select: { invoiceId: true },
+    });
+    if (!target) {
+      throw new NotFoundException({ code: 'CHANGE_REQUEST_NOT_FOUND', message: 'Change request not found' });
+    }
+    await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${target.invoiceId} FOR UPDATE`;
+
+    // Re-read only after the lock is held so invoice lines/returns are current.
     const request = await tx.invoiceChangeRequest.findUnique({
       where: { id: requestId },
       include: { items: true, invoice: { include: { items: true } } },
@@ -640,15 +908,18 @@ export class InvoiceChangeRequestsService {
   /**
    * Return approval transaction (Section 10.4)
    *
-   * Refunds use the effective line price (after any InvoicePriceAdjustment) scaled
-   * by the invoice payment ratio currentTotal/adjustedSubtotal so invoice-level
-   * discounts are allocated proportionally (ISS-004/ISS-022). currentTotal is
-   * floored at 0 after the refund decrement.
+   * Refunds use the effective line price (after any InvoicePriceAdjustment)
+   * multiplied by the invoice-level discount factor, so discounts are allocated
+   * proportionally and the factor stays stable across partial returns
+   * (ISS-004/ISS-022). The invoice total itself is recomputed from persisted
+   * state rather than decremented by the refund amount.
    */
   private async approveReturnTransaction(staleRequest: ChangeRequestWithItems, adminId: number, adminNote?: string) {
     return this.prisma.$transaction(async (tx) => {
       const request = await this.claimAndReload(tx, staleRequest.id, adminId, adminNote);
-      return this.applyReturnActions(tx, request, adminId, adminNote);
+      const result = await this.applyReturnActions(tx, request, adminId, adminNote);
+      const state = await this.recomputeInvoiceTotal(tx, request.invoiceId);
+      return { ...result, newTotal: state.total };
     });
   }
 
@@ -658,10 +929,10 @@ export class InvoiceChangeRequestsService {
    * Serialized lines return a specific sold unit (productUnitId → AVAILABLE).
    * Non-serialized lines return a quantity, which is added back to stock.
    *
-   * Refunds use the effective line price (after any InvoicePriceAdjustment) scaled
-   * by the invoice payment ratio currentTotal/adjustedSubtotal so invoice-level
-   * discounts are allocated proportionally (ISS-004/ISS-022). currentTotal is
-   * floored at 0 after the refund decrement.
+   * Refunds use the effective line price (after any InvoicePriceAdjustment)
+   * multiplied by the invoice-level discount factor, so discounts are allocated
+   * proportionally and the factor stays stable across partial returns
+   * (ISS-004/ISS-022). currentTotal is recomputed from persisted state.
    */
   private async applyReturnActions(
     tx: Prisma.TransactionClient,
@@ -807,218 +1078,189 @@ export class InvoiceChangeRequestsService {
       }
     }
 
-      // Pricing snapshot for discount-aware refund math (ISS-004/ISS-022)
-      const pricing = await tx.invoice.findUnique({
-        where: { id: request.invoiceId },
-        select: {
-          currentTotal: true,
-          items: {
-            select: {
-              id: true,
-              quantity: true,
-              price: true,
-              priceAdjustments: {
-                orderBy: { createdAt: 'desc' },
-                take: 1,
-                select: { newPrice: true },
-              },
-            },
-          },
-        },
+    // Stable pricing snapshot for discount-aware refund math (ISS-004/ISS-022).
+    // The discount factor is derived from the invoice's original terms, so it
+    // stays constant for the life of the invoice instead of drifting as
+    // currentTotal is reduced by earlier returns.
+    const stateBefore = await this.computeInvoiceFinancialState(tx, request.invoiceId);
+    const effectivePriceById = new Map(stateBefore.lines.map((line) => [line.id, line.effectivePrice]));
+
+    let refundTotal = 0;
+    const returnedItems: { model: string; barcode: string; refund: number }[] = [];
+
+    // 6. Discount-aware refunds (ISS-004) + unit/stock release
+    for (const plan of plans) {
+      const effectivePrice = effectivePriceById.get(plan.invoiceItemId) ?? Number(plan.price);
+      // Serialized: refund per unit; non-serialized: refund per quantity returned.
+      const refundAmount = roundMoney(effectivePrice * stateBefore.discountFactor * plan.quantity);
+      plan.refundAmount = refundAmount;
+      refundTotal = roundMoney(refundTotal + refundAmount);
+      returnedItems.push({
+        model: plan.modelName,
+        barcode: plan.serialized ? plan.unit!.barcode : `×${plan.quantity}`,
+        refund: refundAmount,
       });
-      if (!pricing) {
-        throw new NotFoundException({ code: 'INVOICE_NOT_FOUND', message: 'Invoice not found' });
-      }
 
-      const round2 = (n: number) => Math.round(n * 100) / 100;
-      const effectivePriceById = new Map<number, number>();
-      let adjustedSubtotal = 0;
-      for (const item of pricing.items) {
-        const effective =
-          item.priceAdjustments.length > 0
-            ? Number(item.priceAdjustments[0].newPrice)
-            : Number(item.price);
-        effectivePriceById.set(item.id, effective);
-        adjustedSubtotal += effective * item.quantity;
-      }
-      const currentTotal = Number(pricing.currentTotal);
-      // Share of each list-price unit that the customer actually paid after discounts.
-      const paymentRatio = adjustedSubtotal > 0 ? currentTotal / adjustedSubtotal : 0;
-
-      let refundTotal = 0;
-      const returnedItems: { model: string; barcode: string; refund: number }[] = [];
-
-      // 6. Discount-aware refunds (ISS-004) + unit/stock release
-      for (const plan of plans) {
-        const effectivePrice = effectivePriceById.get(plan.invoiceItemId) ?? Number(plan.price);
-        // Serialized: refund per unit; non-serialized: refund per quantity returned.
-        const refundAmount = round2(effectivePrice * paymentRatio * plan.quantity);
-        plan.refundAmount = refundAmount;
-        refundTotal = round2(refundTotal + refundAmount);
-        returnedItems.push({
-          model: plan.modelName,
-          barcode: plan.serialized ? plan.unit!.barcode : `×${plan.quantity}`,
-          refund: refundAmount,
+      if (plan.serialized) {
+        // 9. Change ProductUnit SOLD → AVAILABLE (atomic with version check)
+        const productUnit = plan.unit!;
+        const updateResult = await tx.productUnit.updateMany({
+          where: {
+            id: productUnit.id,
+            status: ProductUnitStatus.SOLD,
+            version: productUnit.version,
+          },
+          data: {
+            status: ProductUnitStatus.AVAILABLE,
+            version: { increment: 1 },
+          },
         });
 
-        if (plan.serialized) {
-          // 9. Change ProductUnit SOLD → AVAILABLE (atomic with version check)
-          const productUnit = plan.unit!;
-          const updateResult = await tx.productUnit.updateMany({
-            where: {
-              id: productUnit.id,
-              status: ProductUnitStatus.SOLD,
-              version: productUnit.version,
-            },
-            data: {
-              status: ProductUnitStatus.AVAILABLE,
-              version: { increment: 1 },
-            },
+        if (updateResult.count === 0) {
+          throw new ConflictException({
+            code: 'CONFLICT',
+            message: `Unit ${productUnit.barcode} status changed by another operation`,
           });
-
-          if (updateResult.count === 0) {
-            throw new ConflictException({
-              code: 'CONFLICT',
-              message: `Unit ${productUnit.barcode} status changed by another operation`,
-            });
-          }
-
-          await tx.invoiceItemUnitAssignment.update({
-            where: { id: plan.assignmentId! },
-            data: { reversedAt: new Date(), reversedByEmployeeId: adminId },
-          });
-
-          // 11. Write ProductUnitAuditLog(RETURNED)
-          await tx.productUnitAuditLog.create({
-            data: {
-              productUnitId: productUnit.id,
-              action: 'RETURNED',
-              invoiceId: request.invoiceId,
-              employeeId: adminId,
-              notes: `Returned via change request #${request.id}`,
-              metadata: {
-                modelName: plan.modelName,
-                barcode: productUnit.barcode,
-                invoiceNumber: request.invoice.invoiceNumber,
-                refund: refundAmount,
-                from: 'SOLD',
-                to: 'AVAILABLE',
-              },
-            },
-          });
-        } else {
-          // Put the returned quantity back into stock (or un-reserve it).
-          await this.restoreNonSerializedStock(tx, plan.invoiceItemId, plan.productModelId, plan.quantity);
         }
-      }
 
-      // 7. Create InvoiceReturn with per-row refund amounts (ISS-004)
-      const invoiceReturn = await tx.invoiceReturn.create({
-        data: {
-          invoiceId: request.invoiceId,
-          requestedById: request.requestedByEmployeeId,
-          approvedById: adminId,
-          reason: request.reason,
-          refundTotal,
-          requestId: request.id,
-          items: {
-            create: plans.map((plan) => ({
-              invoiceItemId: plan.invoiceItemId,
-              productUnitId: plan.productUnitId ?? null,
-              quantity: plan.quantity,
-              refundAmount: plan.refundAmount,
-            })),
-          },
-        },
-      });
-      void invoiceReturn;
-
-      // 12. Update Invoice.currentTotal, floored at 0 (ISS-022)
-      const newTotal = Math.max(0, round2(currentTotal - refundTotal));
-      await tx.invoice.update({
-        where: { id: request.invoiceId },
-        data: {
-          currentTotal: newTotal,
-        },
-      });
-
-      // 13. Write InvoiceAuditLog
-      const isFullReturn = plans.length === request.invoice.items.length;
-      await tx.invoiceAuditLog.create({
-        data: {
-          invoiceId: request.invoiceId,
-          action: isFullReturn
-            ? InvoiceAuditAction.FULL_RETURNED
-            : InvoiceAuditAction.PARTIAL_RETURNED,
-          employeeId: adminId,
-          details: {
-            requestId: request.id,
-            refundTotal,
-            itemsReturned: plans.length,
-            invoiceNumber: request.invoice.invoiceNumber,
-            newTotal,
-            reason: request.reason ?? null,
-            adminNote: adminNote ?? null,
-            items: returnedItems,
-          },
-        },
-      });
-
-      // 15. Create approval notification
-      await tx.notification.create({
-        data: {
-          employeeId: request.requestedByEmployeeId,
-          type: 'RETURN_APPROVED',
-          title: `Return Approved`,
-          message: `Your return request for invoice ${request.invoice.invoiceNumber} has been approved. Refund: ${refundTotal}. Details: ${returnedItems.map((r) => `${r.model} (${r.barcode})`).join(', ')}`,
-          payload: {
-            invoice: request.invoice.invoiceNumber,
-            refund: refundTotal,
-            count: plans.length,
-            itemsSummary: returnedItems.map((r) => `${r.model} (${r.barcode})`).join(', '),
-            reason: request.reason ?? '',
-          },
-          entityType: 'InvoiceChangeRequest',
-          entityId: String(request.id),
-        },
-      });
-
-      // 16. Recalculate low-stock state for every touched model
-      const touchedModelIds = [...new Set(plans.map((p) => p.productModelId))];
-      for (const productModelId of touchedModelIds) {
-        const model = await tx.productModel.findUnique({
-          where: { id: productModelId },
-          select: { name: true, minStockAlert: true },
+        await tx.invoiceItemUnitAssignment.update({
+          where: { id: plan.assignmentId! },
+          data: { reversedAt: new Date(), reversedByEmployeeId: adminId },
         });
-        if (!model) continue;
 
-        const serialized = plans.some((p) => p.productModelId === productModelId && p.serialized);
-        let availableCount = 0;
-        if (serialized) {
-          availableCount = await tx.productUnit.count({
-            where: { productModelId, status: ProductUnitStatus.AVAILABLE },
-          });
-        } else if (typeof (tx.stockLot as { aggregate?: unknown }).aggregate === 'function') {
-          const agg = await tx.stockLot.aggregate({
-            where: { productModelId },
-            _sum: { quantityRemaining: true, quantityReserved: true },
-          });
-          availableCount = (agg._sum?.quantityRemaining ?? 0) - (agg._sum?.quantityReserved ?? 0);
-        }
-
-        if (availableCount <= model.minStockAlert) {
-          await this.notificationsService.createLowStockNotification(productModelId, model.name, availableCount, model.minStockAlert);
-        } else {
-          await this.notificationsService.resolveLowStockNotification(productModelId);
-        }
+        // 11. Write ProductUnitAuditLog(RETURNED)
+        await tx.productUnitAuditLog.create({
+          data: {
+            productUnitId: productUnit.id,
+            action: 'RETURNED',
+            invoiceId: request.invoiceId,
+            employeeId: adminId,
+            notes: `Returned via change request #${request.id}`,
+            metadata: {
+              modelName: plan.modelName,
+              barcode: productUnit.barcode,
+              invoiceNumber: request.invoice.invoiceNumber,
+              refund: refundAmount,
+              from: 'SOLD',
+              to: 'AVAILABLE',
+            },
+          },
+        });
+      } else {
+        // Put the returned quantity back into stock (or un-reserve it).
+        await this.restoreNonSerializedStock(tx, plan.invoiceItemId, plan.productModelId, plan.quantity);
       }
+    }
 
-      return {
-        id: request.id,
-        status: 'APPROVED',
+    // 7. Create InvoiceReturn with per-row refund amounts (ISS-004)
+    const invoiceReturn = await tx.invoiceReturn.create({
+      data: {
+        invoiceId: request.invoiceId,
+        requestedById: request.requestedByEmployeeId,
+        approvedById: adminId,
+        reason: request.reason,
         refundTotal,
-        itemsReturned: plans.length,
-      };
+        requestId: request.id,
+        items: {
+          create: plans.map((plan) => ({
+            invoiceItemId: plan.invoiceItemId,
+            productUnitId: plan.productUnitId ?? null,
+            quantity: plan.quantity,
+            refundAmount: plan.refundAmount,
+          })),
+        },
+      },
+    });
+    void invoiceReturn;
+
+    // 12. Recompute the receivable from the persisted state (returned rows
+    // included). This is the authoritative value; the caller persists it once.
+    const stateAfter = await this.computeInvoiceFinancialState(tx, request.invoiceId);
+    const newTotal = stateAfter.total;
+
+    // 13. Write InvoiceAuditLog. A request is a full return only when no
+    // outstanding quantity remains on any line (not merely when every line
+    // appears once in this request).
+    const isFullReturn =
+      !request.items.some((item) => item.action === ChangeRequestItemAction.ADD_ITEM) &&
+      stateAfter.lines.every((line) => line.remainingQuantity <= 0);
+    await tx.invoiceAuditLog.create({
+      data: {
+        invoiceId: request.invoiceId,
+        action: isFullReturn
+          ? InvoiceAuditAction.FULL_RETURNED
+          : InvoiceAuditAction.PARTIAL_RETURNED,
+        employeeId: adminId,
+        details: {
+          requestId: request.id,
+          refundTotal,
+          itemsReturned: plans.length,
+          invoiceNumber: request.invoice.invoiceNumber,
+          newTotal,
+          reason: request.reason ?? null,
+          adminNote: adminNote ?? null,
+          items: returnedItems,
+        },
+      },
+    });
+
+    // 15. Create approval notification
+    await tx.notification.create({
+      data: {
+        employeeId: request.requestedByEmployeeId,
+        type: 'RETURN_APPROVED',
+        title: `Return Approved`,
+        message: `Your return request for invoice ${request.invoice.invoiceNumber} has been approved. Refund: ${refundTotal}. Details: ${returnedItems.map((r) => `${r.model} (${r.barcode})`).join(', ')}`,
+        payload: {
+          invoice: request.invoice.invoiceNumber,
+          refund: refundTotal,
+          count: plans.length,
+          itemsSummary: returnedItems.map((r) => `${r.model} (${r.barcode})`).join(', '),
+          reason: request.reason ?? '',
+        },
+        entityType: 'InvoiceChangeRequest',
+        entityId: String(request.id),
+      },
+    });
+
+    // 16. Recalculate low-stock state for every touched model
+    const touchedModelIds = [...new Set(plans.map((p) => p.productModelId))];
+    for (const productModelId of touchedModelIds) {
+      const model = await tx.productModel.findUnique({
+        where: { id: productModelId },
+        select: { name: true, minStockAlert: true },
+      });
+      if (!model) continue;
+
+      const serialized = plans.some((p) => p.productModelId === productModelId && p.serialized);
+      let availableCount = 0;
+      if (serialized) {
+        availableCount = await tx.productUnit.count({
+          where: { productModelId, status: ProductUnitStatus.AVAILABLE },
+        });
+      } else if (typeof (tx.stockLot as { aggregate?: unknown }).aggregate === 'function') {
+        const agg = await tx.stockLot.aggregate({
+          where: { productModelId },
+          _sum: { quantityRemaining: true, quantityReserved: true },
+        });
+        availableCount = (agg._sum?.quantityRemaining ?? 0) - (agg._sum?.quantityReserved ?? 0);
+      }
+
+      if (availableCount <= model.minStockAlert) {
+        await this.notificationsService.createLowStockNotification(productModelId, model.name, availableCount, model.minStockAlert);
+      } else {
+        await this.notificationsService.resolveLowStockNotification(productModelId);
+      }
+    }
+
+    return {
+      id: request.id,
+      status: 'APPROVED',
+      refundTotal,
+      itemsReturned: plans.length,
+      totalDelta: roundMoney(newTotal - stateBefore.currentTotal),
+      newTotal,
+    };
   }
 
   /**
@@ -1104,7 +1346,9 @@ export class InvoiceChangeRequestsService {
   private async approvePriceChangeTransaction(staleRequest: any, adminId: number, adminNote?: string) {
     return this.prisma.$transaction(async (tx) => {
       const request = await this.claimAndReload(tx, staleRequest.id, adminId, adminNote);
-      return this.applyPriceActions(tx, request, adminId, adminNote);
+      const result = await this.applyPriceActions(tx, request, adminId, adminNote);
+      const state = await this.recomputeInvoiceTotal(tx, request.invoiceId);
+      return { ...result, newTotal: state.total };
     });
   }
 
@@ -1121,72 +1365,80 @@ export class InvoiceChangeRequestsService {
       if (priceItems.length === 0) {
         return {};
       }
-      let totalDelta = 0;
-      const adjustments: { model: string; oldPrice: number; newPrice: number }[] = [];
+      const stateBefore = await this.computeInvoiceFinancialState(tx, request.invoiceId);
+      const lineById = new Map(stateBefore.lines.map((line) => [line.id, line]));
+      const seenTargets = new Set<number>();
+
+      // Validate duplicates up front so no adjustment is written before the
+      // request is known to be well-formed.
+      for (const priceItem of priceItems) {
+        if (priceItem.invoiceItemId != null) {
+          if (seenTargets.has(priceItem.invoiceItemId)) {
+            throw new BadRequestException({
+              code: 'DUPLICATE_PRICE_CHANGE',
+              message: 'The same invoice line cannot have more than one price change in a request',
+            });
+          }
+          seenTargets.add(priceItem.invoiceItemId);
+        }
+      }
+
+      const adjustments: { model: string; oldPrice: number; newPrice: number; quantity: number }[] = [];
 
       for (const priceItem of priceItems) {
         if (!priceItem.invoiceItemId) {
           throw new BadRequestException({ code: 'INVALID_INVOICE_ITEM', message: 'Price change must identify an invoice item' });
         }
-        const invoiceItem = await tx.invoiceItem.findUnique({
-          where: { id: priceItem.invoiceItemId },
-          include: {
-            productModel: { select: { name: true } },
-            priceAdjustments: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-            },
-          },
-        });
-        const typedInvoiceItem = invoiceItem as (Prisma.InvoiceItemGetPayload<{
-          include: {
-            productModel: { select: { name: true } };
-            priceAdjustments: true;
-          };
-        }> | null);
 
-        if (!typedInvoiceItem) {
+        const line = lineById.get(priceItem.invoiceItemId);
+        if (!line) {
           throw new BadRequestException({ code: 'INVALID_INVOICE_ITEM', message: `Invoice item ${priceItem.invoiceItemId} not found` });
         }
 
-        // 4. Read current effective price
-        const currentEffectivePrice = typedInvoiceItem.priceAdjustments.length > 0
-          ? Number(typedInvoiceItem.priceAdjustments[0].newPrice)
-          : Number(typedInvoiceItem.price);
+        // A price change can only affect units the customer still owns.
+        if (line.remainingQuantity <= 0) {
+          throw new BadRequestException({
+            code: 'INVOICE_ITEM_FULLY_RETURNED',
+            message: `Invoice item ${priceItem.invoiceItemId} has been fully returned and cannot be repriced`,
+          });
+        }
 
-        const newPrice = Number(priceItem.proposedPrice);
-        const delta = newPrice - currentEffectivePrice;
-        totalDelta += delta;
+        const newPrice = roundMoney(Number(priceItem.proposedPrice));
+        if (!Number.isFinite(newPrice) || newPrice < 0) {
+          throw new BadRequestException({ code: 'INVALID_PRICE', message: 'Proposed price must be a non-negative number' });
+        }
+
+        const oldPrice = line.effectivePrice;
         adjustments.push({
-          model: typedInvoiceItem.productModel.name,
-          oldPrice: currentEffectivePrice,
+          model: line.modelName,
+          oldPrice,
           newPrice,
+          quantity: line.remainingQuantity,
         });
 
-        // 5. Create InvoicePriceAdjustment
+        // Record the outstanding quantity so reports/refunds know exactly how
+        // many units this price applies to. InvoiceItem.price stays the
+        // immutable original sale price.
         await tx.invoicePriceAdjustment.create({
           data: {
             invoiceId: request.invoiceId,
             invoiceItemId: priceItem.invoiceItemId,
             requestedById: request.requestedByEmployeeId,
             approvedById: adminId,
-            oldPrice: currentEffectivePrice,
+            oldPrice,
             newPrice,
+            appliedQuantity: line.remainingQuantity,
             reason: request.reason,
             requestId: request.id,
           },
         });
       }
 
-      // 6. Update Invoice.currentTotal by the delta
-      await tx.invoice.update({
-        where: { id: request.invoiceId },
-        data: {
-          currentTotal: {
-            increment: totalDelta,
-          },
-        },
-      });
+      // 6. Derive the new total from persisted state. Never increment by a
+      // per-unit delta: the change applies to the whole outstanding quantity
+      // and must respect invoice-level discounts.
+      const stateAfter = await this.computeInvoiceFinancialState(tx, request.invoiceId);
+      const totalDelta = roundMoney(stateAfter.total - stateBefore.total);
 
       // 7. Write InvoiceAuditLog(PRICE_ADJUSTED)
       await tx.invoiceAuditLog.create({
@@ -1201,6 +1453,7 @@ export class InvoiceChangeRequestsService {
             invoiceNumber: request.invoice.invoiceNumber,
             adminNote: adminNote ?? null,
             adjustments,
+            newTotal: stateAfter.total,
           },
         },
       });
@@ -1211,12 +1464,12 @@ export class InvoiceChangeRequestsService {
           employeeId: request.requestedByEmployeeId,
           type: 'PRICE_CHANGE_APPROVED',
           title: `Price Change Approved`,
-          message: `Your price change request on invoice ${request.invoice.invoiceNumber} has been approved. Adjustment: ${totalDelta >= 0 ? '+' : ''}${totalDelta}. Details: ${adjustments.map((a) => `${a.model}: ${a.oldPrice} → ${a.newPrice}`).join(', ')}`,
+          message: `Your price change request on invoice ${request.invoice.invoiceNumber} has been approved. Adjustment: ${totalDelta >= 0 ? '+' : ''}${totalDelta}. Details: ${adjustments.map((a) => `${a.model}: ${a.oldPrice} → ${a.newPrice} × ${a.quantity}`).join(', ')}`,
           payload: {
             invoice: request.invoice.invoiceNumber,
             delta: totalDelta,
             count: priceItems.length,
-            itemsSummary: adjustments.map((a) => `${a.model}: ${a.oldPrice} → ${a.newPrice}`).join(', '),
+            itemsSummary: adjustments.map((a) => `${a.model}: ${a.oldPrice} → ${a.newPrice} × ${a.quantity}`).join(', '),
           },
           entityType: 'InvoiceChangeRequest',
           entityId: String(request.id),
@@ -1228,13 +1481,19 @@ export class InvoiceChangeRequestsService {
         status: 'APPROVED',
         totalDelta,
         itemsAdjusted: priceItems.length,
+        newTotal: stateAfter.total,
       };
   }
 
   private async approveAddItemTransaction(staleRequest: any, adminId: number, adminNote?: string) {
     return this.prisma.$transaction(async (tx) => {
       const request = await this.claimAndReload(tx, staleRequest.id, adminId, adminNote);
-      return this.applyAddActions(tx, request, adminId, adminNote, { allowAutoReject: true });
+      const result = await this.applyAddActions(tx, request, adminId, adminNote, { allowAutoReject: true });
+      if ((result as { status?: string }).status === 'REJECTED') {
+        return result;
+      }
+      const state = await this.recomputeInvoiceTotal(tx, request.invoiceId);
+      return { ...result, newTotal: state.total };
     });
   }
 
@@ -1243,7 +1502,8 @@ export class InvoiceChangeRequestsService {
    *
    * Phase 1 validates every add-item (model, price, stock) before any mutation,
    * so an insufficient-stock failure never leaves partial reservations.
-   * Phase 2 reserves stock, creates InvoiceItem rows, and increments currentTotal.
+   * Phase 2 reserves stock and creates InvoiceItem rows; the invoice total is
+   * then recomputed from persisted state (including invoice-level discounts).
    *
    * With `allowAutoReject` (add-only requests) an insufficient stock level
    * auto-rejects the request; in a mixed request it fails the whole approval.
@@ -1375,8 +1635,8 @@ export class InvoiceChangeRequestsService {
         plannedAdds.push({ addItem, model, quantity, price });
       }
 
-      // ── Phase 2: reserve stock, create InvoiceItems, update currentTotal ──
-      let totalDelta = 0;
+      // ── Phase 2: reserve stock and create InvoiceItems ──
+      const stateBefore = await this.computeInvoiceFinancialState(tx, request.invoiceId);
 
       for (const planned of plannedAdds) {
         const { model, quantity, price } = planned;
@@ -1422,17 +1682,12 @@ export class InvoiceChangeRequestsService {
             price,
           },
         });
-
-        totalDelta += price * quantity;
       }
 
-      // Increment currentTotal by Σ proposedPrice × quantity (ISS-001)
-      if (totalDelta !== 0) {
-        await tx.invoice.update({
-          where: { id: request.invoiceId },
-          data: { currentTotal: { increment: totalDelta } },
-        });
-      }
+      // Derive the total effect from persisted state. Added lines are valued
+      // under the invoice's discount terms like every other outstanding line.
+      const stateAfter = await this.computeInvoiceFinancialState(tx, request.invoiceId);
+      const totalDelta = roundMoney(stateAfter.total - stateBefore.total);
 
       // Write InvoiceAuditLog(ITEM_ADDED)
       const addedItems = plannedAdds.map((planned) => ({
@@ -1521,6 +1776,7 @@ export class InvoiceChangeRequestsService {
         status: 'APPROVED',
         itemsAdded: addItems.length,
         totalDelta,
+        newTotal: stateAfter.total,
       };
   }
 }

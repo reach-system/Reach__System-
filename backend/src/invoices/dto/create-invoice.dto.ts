@@ -26,6 +26,16 @@ export class CreateInvoiceDto {
   @Min(1)
   customerId: number;
 
+  @ApiPropertyOptional({
+    example: 7,
+    description:
+      'Convert an accepted/sent quotation. The quotation is claimed on save; the submitted items and totals are saved as-is, so they may be edited or extended.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  fromQuotationId?: number;
+
   @ApiPropertyOptional({ example: 'CASH', enum: ['CASH', 'CARD', 'TRANSFER', 'CREDIT'] })
   @IsOptional()
   @IsString()

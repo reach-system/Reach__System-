@@ -23,6 +23,68 @@ describe('GlobalExceptionFilter', () => {
     });
   });
 
+  it('preserves structured 4xx details so clients can name the missing item', () => {
+    const filter = new GlobalExceptionFilter();
+    const json = jest.fn();
+    const status = jest.fn().mockReturnValue({ json });
+    const host = {
+      switchToHttp: () => ({
+        getResponse: () => ({ status }),
+        getRequest: () => ({ url: '/api/invoices' }),
+      }),
+    } as any;
+
+    filter.catch(
+      new BadRequestException({
+        code: 'INSUFFICIENT_STOCK',
+        message: 'Insufficient stock for Nano. Available: 2, requested: 5',
+        productName: 'Nano',
+        available: 2,
+        requested: 5,
+      }),
+      host,
+    );
+
+    expect(status).toHaveBeenCalledWith(HttpStatus.BAD_REQUEST);
+    expect(json).toHaveBeenCalledWith({
+      message: 'Insufficient stock for Nano. Available: 2, requested: 5',
+      code: 'INSUFFICIENT_STOCK',
+      statusCode: HttpStatus.BAD_REQUEST,
+      productName: 'Nano',
+      available: 2,
+      requested: 5,
+    });
+  });
+
+  it('does not leak structured details on 5xx responses', () => {
+    const filter = new GlobalExceptionFilter();
+    const json = jest.fn();
+    const status = jest.fn().mockReturnValue({ json });
+    const host = {
+      switchToHttp: () => ({
+        getResponse: () => ({ status }),
+        getRequest: () => ({ url: '/api/invoices' }),
+      }),
+    } as any;
+
+    filter.catch(
+      new InternalServerErrorException({
+        message: 'db exploded',
+        productName: 'Nano',
+        available: 2,
+        requested: 5,
+      }),
+      host,
+    );
+
+    expect(status).toHaveBeenCalledWith(HttpStatus.INTERNAL_SERVER_ERROR);
+    expect(json).toHaveBeenCalledWith({
+      message: "We're having trouble connecting. Please try again shortly.",
+      code: 'INTERNAL_SERVER_ERROR',
+      statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+    });
+  });
+
   it('serializes unknown errors to a safe user-facing response', () => {
     const filter = new GlobalExceptionFilter();
     const json = jest.fn();

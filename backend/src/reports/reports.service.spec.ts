@@ -38,9 +38,9 @@ describe('ReportsService', () => {
           findMany: jest.fn().mockResolvedValue([{ price: 100, quantity: 2 }]),
         },
         invoicePriceAdjustment: {
-          aggregate: jest.fn().mockResolvedValue({
-            _sum: { newPrice: 150, oldPrice: 100 },
-          }),
+          findMany: jest.fn().mockResolvedValue([
+            { newPrice: 150, oldPrice: 100, appliedQuantity: 2 },
+          ]),
         },
         invoiceReturnItem: {
           aggregate: jest.fn().mockResolvedValue({
@@ -61,10 +61,12 @@ describe('ReportsService', () => {
       const result = await service.computeRevenue('2026-09-01', '2026-09-30');
 
       expect(result.originalSales).toBe(200);
-      expect(result.approvedAdjustments).toBe(50);
+      // (150 − 100) × appliedQuantity 2 = 100 — the old code summed price
+      // differences without the quantity, reporting 50.
+      expect(result.approvedAdjustments).toBe(100);
       expect(result.approvedReturns).toBe(50);
-      expect(result.netSales).toBe(200);
-      expect(prisma.invoicePriceAdjustment.aggregate).toHaveBeenCalledWith(
+      expect(result.netSales).toBe(250);
+      expect(prisma.invoicePriceAdjustment.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
             invoice: { status: 'DELIVERED' },

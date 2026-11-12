@@ -1,25 +1,30 @@
+/* ==========================================================================
+   PAGE SETUP — the single source of truth for paper size and margins.
+
+   Order matters: an unnamed @page applies to EVERY page (named ones included)
+   and, at equal specificity, the later rule wins. So the default page must be
+   declared first and named pages after it.
+   ========================================================================== */
+
+/* Invoices and disbursement vouchers: portrait A4 with a 4mm safe border. */
+@page {
+  size: A4;
+  margin: 4mm;
+}
+
+/* Reports: landscape A4 so wide financial tables fit without clipping.
+   12mm margins leave room for the page counter in the bottom margin. */
 @page report-landscape {
   size: A4 landscape;
   margin: 12mm;
 
   @bottom-center {
+    /* LTR, otherwise an RTL document prints "3 / 1" instead of "1 / 3". */
+    direction: ltr;
     content: counter(page) " / " counter(pages);
     color: #555;
     font-family: "Manrope", "Cairo", Arial, sans-serif;
-    font-size: 9pt;
-  }
-}
-
-/* Default @page is provided by PrintDocumentLayout (4mm margin) for invoices/vouchers.
-   Reports use the named 'report-landscape' page above. */
-  size: A4 landscape;
-  margin: 12mm;
-
-  @bottom-center {
-    content: counter(page) " / " counter(pages);
-    color: #555;
-    font-family: "Manrope", "Cairo", Arial, sans-serif;
-    font-size: 9pt;
+    font-size: 8pt;
   }
 }
 
@@ -657,6 +662,18 @@
   display: none;
 }
 
+/* The report header is paper-only: its band and context are hidden on screen,
+   so leaving the sheet itself visible paints an empty A4 box above the report.
+   Two classes + !important beat the per-instance `.print-document { display:flex }`
+   style injected by PrintDocumentLayout (same specificity, later in the DOM),
+   which otherwise wins and shows the empty sheet. Scoped to reports so the
+   invoice preview (`.invoice-document--preview`) stays visible. */
+@media screen {
+  .print-document.report-print-document {
+    display: none !important;
+  }
+}
+
 @media print {
   *,
   *::before,
@@ -676,7 +693,9 @@
   .print-document {
     page: auto;
     width: 100%;
-    min-height: 97vh;
+    /* Was 97vh: a "full page" minimum pushed the next block to a second
+       page (report header alone on page 1, invoice audit alone on page 2). */
+    min-height: 0;
     overflow: visible;
     color: var(--pn-ink, #1a1a1a);
     font-family: "Cairo", "Manrope", Arial, sans-serif;
@@ -688,6 +707,54 @@
 
   .reports-layout .print-area {
     page: report-landscape;
+  }
+
+  /* The document element must be on the named page too. Without this, the
+     remaining `page: auto` boxes in the app shell can add a trailing blank
+     portrait page after the landscape report ends. */
+  body:has(.report-print-document) {
+    page: report-landscape;
+  }
+
+  /* Invoices / vouchers: one page, footer pinned to the bottom. */
+  .print-document:not(.report-print-document):not(.print-document--landscape) {
+    min-height: 97vh;
+  }
+
+  /* Reports: a compact header band. The screen band is 44mm; at 210mm - 24mm
+     of usable page height that alone is a quarter of the sheet. */
+  .report-print-document .print-document__header {
+    height: 26mm;
+    min-height: 26mm;
+    margin-bottom: 3mm;
+  }
+
+  .report-print-document .print-document__header-inner {
+    min-height: 26mm;
+    padding: 3mm 8mm;
+  }
+
+  .report-print-document .print-document__content {
+    padding-block: 2mm 0;
+  }
+
+  /* Report density: a summary report (KPIs + invoice table + daily table)
+     must fit one A4 landscape sheet. These rules are report-scoped only. */
+  .reports-layout .print-area {
+    --section-gap: 6px;
+  }
+
+  .reports-layout .print-area .kpi-card {
+    min-height: 0 !important;
+    padding: 8px 10px 10px !important;
+  }
+
+  .reports-layout .print-area td {
+    padding: 3px 8px !important;
+  }
+
+  .reports-layout .print-area .ui-card > div:last-child {
+    padding: 8px 10px !important;
   }
 
   .print-document__header {
@@ -703,9 +770,14 @@
   }
 
   .report-print-document {
+    /* The report header is a band + context strip, not a full sheet. */
+    min-height: 0;
     margin-bottom: 5mm;
     break-inside: avoid;
     page-break-inside: avoid;
+    /* Never leave the band orphaned at the bottom of a page. */
+    break-after: avoid;
+    page-break-after: avoid;
   }
 
   .report-context {
@@ -803,7 +875,8 @@
   }
 
   .print-document__content tfoot {
-    display: table-footer-group;
+    /* Totals appear once, at the end, not on every page. */
+    display: table-row-group;
   }
 
   .print-document__content tr,

@@ -1,5 +1,4 @@
-﻿
-import {
+﻿import {
   PrismaClient,
   Role,
   ProductModel,
@@ -95,7 +94,7 @@ const PRODUCTS: SeedProduct[] = [
 
   // ───── HST — Serialized ─────
   s('HST', 'لوحة 1loop الاقتصادية hst', 2),
-  s('HST', 'لوحة 2loop القتصادية hst', 0),
+  s('HST', 'لوحة 2loop الاقتصادية hst', 0),
   s('HST', 'لوحة 2loop الحمرة hst', 2),
   s('HST', 'لوحة 4loop الحمرة hst', 0),
 
@@ -158,6 +157,11 @@ const PRODUCTS: SeedProduct[] = [
 /*  Clean database                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Order matters: children (tables holding the foreign key) must be
+ * deleted before their parents. $transaction([...]) runs the operations
+ * in the order written, and rolls everything back if one fails.
+ */
 async function cleanDatabase() {
   await prisma.$transaction([
     prisma.stockConsumption.deleteMany(),
@@ -178,6 +182,12 @@ async function cleanDatabase() {
     prisma.invoiceAuditLog.deleteMany(),
 
     prisma.invoice.deleteMany(),
+
+    // Quotations: QuotationItem points to ProductModel, so it must go
+    // before productModel. Placed after invoice assuming
+    // Invoice -> Quotation (e.g. Invoice.quotationId).
+    prisma.quotationItem.deleteMany(),
+    prisma.quotation.deleteMany(),
 
     prisma.stockReceiptItem.deleteMany(),
     prisma.stockLot.deleteMany(),
@@ -375,6 +385,341 @@ async function seedProductModels(
   return result;
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Suppliers, customers, opening stock and test invoices               */
+/* ------------------------------------------------------------------ */
+
+async function seedSuppliers() {
+  console.log('  • Creating test suppliers');
+
+  const supplierData = [
+    { name: 'شركة الأمان لأنظمة الحريق', phone: '01010001001', address: 'القاهرة، مدينة نصر، شارع عباس العقاد' },
+    { name: 'المتحدة للتوريدات الهندسية', phone: '01010001002', address: 'الجيزة، المهندسين، شارع جامعة الدول' },
+    { name: 'النور للتجارة والتوكيلات', phone: '01010001003', address: 'القاهرة، مصر الجديدة، شارع الحجاز' },
+    { name: 'دلتا لمستلزمات الأمن والسلامة', phone: '01010001004', address: 'الإسكندرية، سموحة، شارع فوزي معاذ' },
+    { name: 'المصرية للتوريدات الصناعية', phone: '01010001005', address: 'القاهرة، جسر السويس، المنطقة الصناعية' },
+    { name: 'مورد تجريبي غير نشط', phone: '01010001006', address: 'عنوان تجريبي لاختبار حالة المورد' },
+  ];
+
+  const suppliers = [];
+  for (const [index, data] of supplierData.entries()) {
+    suppliers.push(await prisma.supplier.create({
+      data: { ...data, isActive: index !== supplierData.length - 1 },
+    }));
+  }
+  return suppliers;
+}
+
+async function seedCustomers() {
+  console.log('  • Creating test customers');
+
+  const customerData = [
+    { name: 'شركة دلتا للمقاولات', type: 'COMPANY' as const, phone: '01120002001' },
+    { name: 'شركة النخبة للإنشاءات', type: 'COMPANY' as const, phone: '01120002002' },
+    { name: 'مؤسسة المستقبل للمشروعات', type: 'COMPANY' as const, phone: '01120002003' },
+    { name: 'أحمد محمد علي', type: 'INDIVIDUAL' as const, phone: '01230003001' },
+    { name: 'محمود إبراهيم حسن', type: 'INDIVIDUAL' as const, phone: '01230003002' },
+    { name: 'يوسف خالد', type: 'INDIVIDUAL' as const, phone: '01230003003' },
+    { name: 'عميل بدون رقم هاتف', type: 'INDIVIDUAL' as const, phone: null },
+    { name: 'عميل تجريبي غير نشط', type: 'COMPANY' as const, phone: '01120002007', isActive: false },
+  ];
+
+  const customers = [];
+  for (const data of customerData) {
+    const { isActive = true, ...customer } = data;
+    customers.push(await prisma.customer.create({
+      data: { ...customer, isActive },
+    }));
+  }
+  return customers;
+}
+
+async function seedOpeningStock(
+  products: SeededProduct[],
+  suppliers: Awaited<ReturnType<typeof seedSuppliers>>,
+  staff: Awaited<ReturnType<typeof seedEmployees>>,
+) {
+  console.log('  • Creating priced opening receipts and stock lots');
+
+  const receiptDates = suppliers.slice(0, -1).map(
+    (_, index) => new Date(`2026-10-${String(index + 1).padStart(2, '0')}T09:00:00+02:00`),
+  );
+  const receipts = await Promise.all(suppliers.slice(0, -1).map((supplier, index) =>
+    prisma.stockReceipt.create({
+      data: {
+        employeeId: staff.inventory.id,
+        supplierId: supplier.id,
+        status: 'PRICED',
+        pricedByEmployeeId: staff.accountant.id,
+        pricedAt: new Date(receiptDates[index].getTime() + 3 * 60 * 60 * 1000),
+        date: receiptDates[index],
+      },
+    }),
+  ));
+
+  const lots = new Map<number, { id: number; remaining: number; cost: number }>();
+
+  for (const [index, product] of products.entries()) {
+    if (product.model.isSerialized || product.quantity <= 0) continue;
+
+    const supplierIndex = index % receipts.length;
+    const receiptDate = receiptDates[supplierIndex];
+    const receipt = receipts[supplierIndex];
+
+    // Synthetic purchase costs are test fixtures, not real supplier quotations.
+    const purchasePrice = Number((12 + (index % 17) * 7.5).toFixed(2));
+    const lot = await prisma.stockLot.create({
+      data: {
+        productModelId: product.model.id,
+        stockReceiptId: receipt.id,
+        supplierId: suppliers[supplierIndex].id,
+        quantityReceived: product.quantity,
+        quantityRemaining: product.quantity,
+        quantityReserved: 0,
+        purchasePrice: purchasePrice.toFixed(2),
+        receivedDate: receiptDate,
+      },
+    });
+    lots.set(product.model.id, {
+      id: lot.id,
+      remaining: product.quantity,
+      cost: purchasePrice,
+    });
+  }
+
+  return lots;
+}
+
+async function seedTestInvoices(
+  products: SeededProduct[],
+  customers: Awaited<ReturnType<typeof seedCustomers>>,
+  staff: Awaited<ReturnType<typeof seedEmployees>>,
+  lots: Map<number, { id: number; remaining: number; cost: number }>,
+) {
+  console.log('  • Creating test invoices');
+
+  const productByName = new Map(products.map((entry) => [entry.model.name, entry]));
+  const requireProduct = (name: string) => {
+    const entry = productByName.get(name);
+    if (!entry) throw new Error(`Seed product not found: ${name}`);
+    if (entry.model.isSerialized) {
+      throw new Error(`Test invoice fixture must not select serialized product: ${name}`);
+    }
+    return entry;
+  };
+
+  const smoke = requireProduct('حساس دخان تقليدي hst');
+  const siren = requireProduct('سرينة hst');
+  const breakGlass = requireProduct('كاسر hst');
+  const cable = requireProduct('كابلات نحاس 500 متر');
+
+  const createInvoice = async (args: {
+    customerId: number;
+    invoiceNumber: string;
+    status: 'PENDING_ACCOUNTANT' | 'CONFIRMED' | 'CANCELLED' | 'DELIVERED';
+    items: Array<{ product: SeededProduct; quantity: number; price: number }>;
+    note: string;
+    paymentType: string;
+    discountPercentage?: number;
+    rejectionReason?: string;
+  }) => {
+    const subtotal = args.items.reduce((sum, item) => sum + item.quantity * item.price, 0);
+    const discountPercentage = args.discountPercentage ?? 0;
+    const discountAmount = Number((subtotal * discountPercentage / 100).toFixed(2));
+    const total = Number((subtotal - discountAmount).toFixed(2));
+    const now = new Date();
+
+    const invoice = await prisma.invoice.create({
+      data: {
+        invoiceNumber: args.invoiceNumber,
+        customerId: args.customerId,
+        employeeId: staff.sales.id,
+        status: args.status,
+        confirmedByEmployeeId: args.status === 'CONFIRMED' || args.status === 'DELIVERED'
+          ? staff.accountant.id : null,
+        confirmedAt: args.status === 'CONFIRMED' || args.status === 'DELIVERED'
+          ? now : null,
+        rejectedByEmployeeId: args.status === 'CANCELLED' ? staff.accountant.id : null,
+        rejectedAt: args.status === 'CANCELLED' ? now : null,
+        rejectionReason: args.rejectionReason ?? null,
+        deliveredByEmployeeId: args.status === 'DELIVERED' ? staff.inventory.id : null,
+        deliveredAt: args.status === 'DELIVERED' ? now : null,
+        paymentType: args.paymentType,
+        note: args.note,
+        discountPercentage: discountPercentage.toFixed(2),
+        discountAmount: discountAmount.toFixed(2),
+        date: now,
+        originalTotal: total.toFixed(2),
+        currentTotal: total.toFixed(2),
+        items: {
+          create: args.items.map((item) => ({
+            productModelId: item.product.model.id,
+            quantity: item.quantity,
+            price: item.price.toFixed(2),
+            costAtSale: args.status === 'DELIVERED'
+              ? (lots.get(item.product.model.id)?.cost ?? 0).toFixed(2)
+              : null,
+            cogsStatus: args.status === 'DELIVERED' ? 'FINAL' : 'PENDING',
+          })),
+        },
+      },
+      include: { items: true },
+    });
+
+    await prisma.invoiceAuditLog.createMany({
+      data: [
+        {
+          invoiceId: invoice.id,
+          employeeId: staff.sales.id,
+          action: 'CREATED',
+          details: { source: 'SEED_TEST_DATA', note: args.note },
+        },
+        {
+          invoiceId: invoice.id,
+          employeeId: staff.sales.id,
+          action: 'SENT_FOR_ACCOUNTANT_REVIEW',
+          details: { source: 'SEED_TEST_DATA' },
+        },
+        ...(args.status === 'CONFIRMED' || args.status === 'DELIVERED'
+          ? [{
+              invoiceId: invoice.id,
+              employeeId: staff.accountant.id,
+              action: 'CONFIRMED' as const,
+              details: { source: 'SEED_TEST_DATA' },
+            }]
+          : []),
+        ...(args.status === 'CANCELLED'
+          ? [{
+              invoiceId: invoice.id,
+              employeeId: staff.accountant.id,
+              action: 'REJECTED' as const,
+              details: { source: 'SEED_TEST_DATA', reason: args.rejectionReason },
+            }]
+          : []),
+        ...(args.status === 'DELIVERED'
+          ? [{
+              invoiceId: invoice.id,
+              employeeId: staff.inventory.id,
+              action: 'DELIVERED' as const,
+              details: { source: 'SEED_TEST_DATA' },
+            }]
+          : []),
+      ],
+    });
+
+    // Keep the stock ledger consistent with the seeded invoice state.
+    if (args.status === 'CONFIRMED') {
+      for (const item of args.items) {
+        const lot = lots.get(item.product.model.id);
+        if (!lot || lot.remaining < item.quantity) {
+          throw new Error(`Insufficient seeded stock for confirmed invoice ${args.invoiceNumber}`);
+        }
+        lot.remaining -= item.quantity;
+        await prisma.stockLot.update({
+          where: { id: lot.id },
+          data: { quantityReserved: { increment: item.quantity } },
+        });
+        await prisma.productModel.update({
+          where: { id: item.product.model.id },
+          data: { reservedQuantity: { increment: item.quantity } },
+        });
+        await prisma.invoiceAuditLog.create({
+          data: {
+            invoiceId: invoice.id,
+            employeeId: staff.accountant.id,
+            action: 'STOCK_RESERVED',
+            details: { source: 'SEED_TEST_DATA', quantity: item.quantity, stockLotId: lot.id },
+          },
+        });
+      }
+    }
+
+    if (args.status === 'DELIVERED') {
+      for (const [index, item] of args.items.entries()) {
+        const lot = lots.get(item.product.model.id);
+        if (!lot || lot.remaining < item.quantity) {
+          throw new Error(`Insufficient seeded stock for delivered invoice ${args.invoiceNumber}`);
+        }
+        lot.remaining -= item.quantity;
+        await prisma.stockLot.update({
+          where: { id: lot.id },
+          data: { quantityRemaining: { decrement: item.quantity } },
+        });
+        await prisma.stockConsumption.create({
+          data: {
+            invoiceItemId: invoice.items[index].id,
+            stockLotId: lot.id,
+            quantity: item.quantity,
+            unitCost: lot.cost.toFixed(2),
+            totalCost: (lot.cost * item.quantity).toFixed(2),
+          },
+        });
+      }
+    }
+
+    return invoice;
+  };
+
+  await createInvoice({
+    customerId: customers[0].id,
+    invoiceNumber: 'INV-000001',
+    status: 'PENDING_ACCOUNTANT',
+    items: [
+      { product: smoke, quantity: 12, price: 185 },
+      { product: siren, quantity: 6, price: 240 },
+      { product: breakGlass, quantity: 4, price: 135 },
+    ],
+    note: 'فاتورة اختبار معلقة للمراجعة المحاسبية - توريد مشروع إداري',
+    paymentType: 'CASH',
+    discountPercentage: 5,
+  });
+
+  await createInvoice({
+    customerId: customers[1].id,
+    invoiceNumber: 'INV-000002',
+    status: 'CONFIRMED',
+    items: [
+      { product: smoke, quantity: 5, price: 190 },
+      { product: siren, quantity: 3, price: 250 },
+    ],
+    note: 'فاتورة اختبار مؤكدة - في انتظار استكمال التسليم',
+    paymentType: 'CREDIT',
+    discountPercentage: 2,
+  });
+
+  await createInvoice({
+    customerId: customers[2].id,
+    invoiceNumber: 'INV-000003',
+    status: 'DELIVERED',
+    items: [
+      { product: breakGlass, quantity: 2, price: 145 },
+      { product: cable, quantity: 25, price: 18 },
+    ],
+    note: 'فاتورة اختبار تم تسليمها بالكامل',
+    paymentType: 'BANK_TRANSFER',
+  });
+
+  await createInvoice({
+    customerId: customers[3].id,
+    invoiceNumber: 'INV-000004',
+    status: 'CANCELLED',
+    items: [{ product: smoke, quantity: 2, price: 185 }],
+    note: 'فاتورة اختبار مرفوضة لاختبار سبب الرفض',
+    paymentType: 'CASH',
+    rejectionReason: 'بيانات الطلب غير مكتملة - سجل تجريبي',
+  });
+
+  await prisma.invoiceSequence.upsert({
+    where: { id: 1 },
+    update: { currentNumber: 4 },
+    create: { id: 1, currentNumber: 4 },
+  });
+
+  return 4;
+}
+
+
 /* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
@@ -452,6 +797,15 @@ async function main() {
   const products = await seedProductModels(categories);
 
   /* -------------------------------------------------------------- */
+  /* Suppliers, customers, opening stock and invoices                */
+  /* -------------------------------------------------------------- */
+
+  const suppliers = await seedSuppliers();
+  const customers = await seedCustomers();
+  const openingLots = await seedOpeningStock(products, suppliers, staff);
+  const invoiceCount = await seedTestInvoices(products, customers, staff, openingLots);
+
+  /* -------------------------------------------------------------- */
   /* Statistics                                                        */
   /* -------------------------------------------------------------- */
 
@@ -508,8 +862,10 @@ async function main() {
   console.log(
     `Non-serialized stock count: ${nonSerializedPhysicalCount}`,
   );
-  console.log('Customers:                 0');
-  console.log('Suppliers:                 0');
+  console.log(`Customers:                 ${customers.length}`);
+  console.log(`Suppliers:                 ${suppliers.length}`);
+  console.log(`Invoices:                  ${invoiceCount}`);
+  console.log(`Opening stock lots:         ${openingLots.size}`);
   console.log('========================================\n');
 
   console.log('Serialized stocktake:');
@@ -534,22 +890,13 @@ async function main() {
   console.log('NOTE');
   console.log('========================================');
   console.log(
-    'Only employees and products/categories were seeded.',
+    'Test suppliers, customers, invoices and non-serialized opening stock were seeded.',
   );
   console.log(
-    'No customers were created.',
+    'Serialized quantities remain stocktake reference counts; no fake ProductUnit barcodes were generated.',
   );
   console.log(
-    'No suppliers were created.',
-  );
-  console.log(
-    'No opening StockLots were created.',
-  );
-  console.log(
-    'Serialized quantities are stocktake reference counts.',
-  );
-  console.log(
-    'ProductUnit records require real barcodes.',
+    'Purchase prices and invoice records are synthetic test fixtures, not real transactions.',
   );
   console.log('========================================\n');
 }
@@ -567,4 +914,3 @@ main()
   .finally(async () => {
     await prisma.$disconnect();
   });
-

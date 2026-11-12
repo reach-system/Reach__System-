@@ -2,8 +2,18 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException, 
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RealtimeService } from '../realtime/realtime.service';
-import { ProductUnitStatus, Prisma, InvoiceAuditAction, InvoiceStatus, Role } from '@prisma/client';
+import { ProductModelsService } from '../product-models/product-models.service';
+import {
+  ProductUnitStatus,
+  Prisma,
+  InvoiceAuditAction,
+  InvoiceStatus,
+  QuotationEventType,
+  QuotationStatus,
+  Role,
+} from '@prisma/client';
 import { normalizeQuantity, roundQuantity } from '../common/quantity.util';
+import { calculateInvoiceTotals } from '../common/invoice-totals.util';
 
 type InvoiceTransactionResult = {
   invoice: Prisma.InvoiceGetPayload<{}>;
@@ -18,6 +28,7 @@ export class InvoicesService {
   constructor(
     private prisma: PrismaService,
     private notificationsService: NotificationsService,
+    private productModelsService: ProductModelsService,
     private realtimeService?: RealtimeService,
   ) {}
 
@@ -52,18 +63,7 @@ export class InvoicesService {
     discountPercentage = 0,
     discountAmount = 0,
   ) {
-    const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const safePercentage = Math.max(0, Math.min(discountPercentage || 0, 100));
-    const safeFixedDiscount = Math.max(0, discountAmount || 0);
-    const percentageDiscount = subtotal * (safePercentage / 100);
-    const total = Math.max(0, subtotal - percentageDiscount - safeFixedDiscount);
-
-    return {
-      subtotal,
-      percentageDiscount,
-      fixedDiscount: Math.min(safeFixedDiscount, subtotal),
-      total,
-    };
+    return calculateInvoiceTotals(items, discountPercentage, discountAmount);
   }
 
   private async claimIdempotencyKey(employeeId: number, rawKey: string): Promise<Prisma.JsonValue | null> {
@@ -114,12 +114,66 @@ export class InvoicesService {
 
   async createInvoice(employeeId: number, data: {
     customerId: number;
+    fromQuotationId?: number;
     paymentType?: string;
     note?: string;
     discountPercentage?: number;
     discountAmount?: number;
     items: { productModelId: number; quantity: number; price: number }[];
   }, idempotencyKey?: string) {
+    let quotationContext: { id: number; quotationNumber: string } | null = null;
+
+    if (data.fromQuotationId) {
+      const quotation = await this.prisma.quotation.findFirst({
+        where: { id: data.fromQuotationId, deletedAt: null },
+      });
+      if (!quotation) {
+        throw new NotFoundException({
+          code: 'QUOTATION_NOT_FOUND',
+          message: 'Quotation not found',
+        });
+      }
+      if (
+        quotation.status === QuotationStatus.CONVERTED ||
+        quotation.convertedInvoiceId !== null
+      ) {
+        throw new ConflictException({
+          code: 'QUOTATION_ALREADY_CONVERTED',
+          message: 'This quotation has already been converted to an invoice',
+        });
+      }
+      if (
+        quotation.status !== QuotationStatus.SENT &&
+        quotation.status !== QuotationStatus.ACCEPTED
+      ) {
+        throw new BadRequestException({
+          code: 'INVALID_QUOTATION_STATUS',
+          message: `A ${quotation.status} quotation cannot be converted`,
+        });
+      }
+      if (quotation.validUntil.getTime() < Date.now()) {
+        throw new BadRequestException({
+          code: 'QUOTATION_EXPIRED',
+          message: 'This quotation has expired and can no longer be converted',
+        });
+      }
+      if (quotation.customerId !== data.customerId) {
+        throw new BadRequestException({
+          code: 'QUOTATION_CUSTOMER_MISMATCH',
+          message: 'The invoice customer must match the quotation customer',
+        });
+      }
+
+      // Conversion is a convenience prefill, not a lock: the invoice keeps
+      // whatever items, prices, and discounts the user submits, so a converted
+      // quotation can be edited or extended like any brand-new invoice. The
+      // quotation is still claimed below so it cannot be converted twice.
+      quotationContext = {
+        id: quotation.id,
+        quotationNumber: quotation.quotationNumber,
+      };
+    }
+
     const customer = await this.prisma.customer.findFirst({
       where: { id: data.customerId, isActive: true, deletedAt: null },
     });
@@ -158,6 +212,9 @@ export class InvoicesService {
           throw new BadRequestException({
             code: 'INSUFFICIENT_STOCK',
             message: `Insufficient stock for ${model.name}. Available: ${sellable}, requested: ${item.quantity}`,
+            productName: model.name,
+            available: sellable,
+            requested: item.quantity,
           });
         }
         serializedItems.push({ productModelId: item.productModelId, quantity: item.quantity, price: item.price, model });
@@ -174,6 +231,9 @@ export class InvoicesService {
           throw new BadRequestException({
             code: 'INSUFFICIENT_STOCK',
             message: `Insufficient stock for ${model.name}. Available: ${available}, requested: ${item.quantity}`,
+            productName: model.name,
+            available,
+            requested: item.quantity,
           });
         }
         nonSerializedItems.push({ productModelId: item.productModelId, quantity: item.quantity, price: item.price, model });
@@ -227,6 +287,9 @@ export class InvoicesService {
           throw new ConflictException({
             code: 'INSUFFICIENT_STOCK',
             message: `Insufficient stock for ${si.model.name}. Available: ${sellable}, requested: ${si.quantity}`,
+            productName: si.model.name,
+            available: sellable,
+            requested: si.quantity,
           });
         }
       }
@@ -259,6 +322,9 @@ export class InvoicesService {
           throw new ConflictException({
             code: 'INSUFFICIENT_STOCK',
             message: `Insufficient stock for ${nsi.model.name} during reservation`,
+            productName: nsi.model.name,
+            available: roundQuantity(nsi.quantity - remainingToReserve),
+            requested: nsi.quantity,
           });
         }
       }
@@ -296,6 +362,46 @@ export class InvoicesService {
             productModelId: nsi.productModelId,
             quantity: nsi.quantity,
             price: nsi.price,
+          },
+        });
+      }
+
+      if (quotationContext) {
+        // Atomic claim: exactly one invoice can win the conversion. The unique
+        // convertedInvoiceId column is the last line of defence if this race is
+        // ever bypassed.
+        const claimed = await tx.quotation.updateMany({
+          where: {
+            id: quotationContext.id,
+            status: { in: [QuotationStatus.SENT, QuotationStatus.ACCEPTED] },
+            convertedInvoiceId: null,
+            deletedAt: null,
+            validUntil: { gte: new Date() },
+          },
+          data: {
+            status: QuotationStatus.CONVERTED,
+            convertedInvoiceId: invoice.id,
+            convertedAt: new Date(),
+          },
+        });
+
+        if (claimed.count !== 1) {
+          throw new ConflictException({
+            code: 'QUOTATION_ALREADY_CONVERTED',
+            message: 'This quotation was already converted or has expired',
+          });
+        }
+
+        await tx.quotationEvent.create({
+          data: {
+            quotationId: quotationContext.id,
+            type: QuotationEventType.CONVERTED,
+            actorId: employeeId,
+            message: `Converted to invoice ${invoiceNumber}`,
+            metadata: {
+              invoiceId: invoice.id,
+              invoiceNumber,
+            },
           },
         });
       }
@@ -381,6 +487,8 @@ export class InvoicesService {
       discountPercentage: invoice.discountPercentage,
       discountAmount: invoice.discountAmount,
       itemCount: data.items.length,
+      fromQuotationId: quotationContext?.id ?? null,
+      quotationNumber: quotationContext?.quotationNumber ?? null,
     };
     if (idempotencyClaimed && normalizedIdempotencyKey) {
       await this.prisma.idempotencyKey.update({
@@ -430,7 +538,48 @@ export class InvoicesService {
       payload: { status: invoice.status },
     });
 
+    if (quotationContext) {
+      this.realtimeService?.publish({
+        type: 'quotation.converted',
+        entity: 'Quotation',
+        entityId: quotationContext.id,
+        roles: [Role.ADMIN, Role.SALES],
+        payload: {
+          status: QuotationStatus.CONVERTED,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+        },
+      });
+    }
+
     return response;
+  }
+
+  private async syncInvoiceProductLastPrices(
+    tx: Prisma.TransactionClient,
+    invoiceId: number,
+    items: Array<{ productModelId: number; price: Prisma.Decimal | number }>,
+    effectiveAt: Date,
+  ) {
+    const latestByProduct = new Map<number, number>();
+
+    for (const item of items) {
+      if (!item.productModelId) continue;
+      const normalized = Number(item.price);
+      if (Number.isFinite(normalized)) {
+        latestByProduct.set(item.productModelId, normalized);
+      }
+    }
+
+    for (const [productModelId, price] of latestByProduct.entries()) {
+      await this.productModelsService.upsertInvoiceLastPrice(
+        tx,
+        productModelId,
+        price,
+        invoiceId,
+        effectiveAt,
+      );
+    }
   }
 
   async confirmInvoice(invoiceId: number, employeeId: number) {
@@ -528,6 +677,13 @@ export class InvoicesService {
           });
         }
       }
+
+      await this.syncInvoiceProductLastPrices(
+        tx,
+        invoiceId,
+        invoice.items.map((item) => ({ productModelId: item.productModelId, price: item.price })),
+        new Date(),
+      );
 
       await tx.invoiceAuditLog.create({
         data: {
@@ -800,6 +956,10 @@ export class InvoicesService {
           include: {
             productModel: {
               select: { id: true, name: true, isSerialized: true, unit: true },
+            },
+            priceAdjustments: {
+              orderBy: { createdAt: 'desc' },
+              select: { id: true, oldPrice: true, newPrice: true, createdAt: true },
             },
             unitAssignments: {
               where: { reversedAt: null },

@@ -56,12 +56,12 @@ export class ReportsService {
         where: { invoice: { date: { gte: start, lt: end }, ...completedSalesInvoice } },
         select: { price: true, quantity: true },
       }),
-      this.prisma.invoicePriceAdjustment.aggregate({
+      this.prisma.invoicePriceAdjustment.findMany({
         where: {
           createdAt: { gte: start, lt: end },
           invoice: completedSalesInvoice,
         },
-        _sum: { newPrice: true, oldPrice: true },
+        select: { newPrice: true, oldPrice: true, appliedQuantity: true },
       }),
       this.prisma.invoiceReturnItem.aggregate({
         where: {
@@ -81,9 +81,17 @@ export class ReportsService {
       (total, item) => total + Number(item.price) * item.quantity,
       0,
     );
-    const adjNew = Number(adjustmentsResult._sum?.newPrice) || 0;
-    const adjOld = Number(adjustmentsResult._sum?.oldPrice) || 0;
-    const approvedAdjustments = adjNew - adjOld;
+    const approvedAdjustments = (adjustmentsResult as {
+      newPrice: Prisma.Decimal | number;
+      oldPrice: Prisma.Decimal | number;
+      appliedQuantity: number | null;
+    }[]).reduce(
+      (total, adjustment) =>
+        total +
+        (Number(adjustment.newPrice) - Number(adjustment.oldPrice)) *
+          Number(adjustment.appliedQuantity ?? 1),
+      0,
+    );
     const approvedReturns = Number(returnsResult._sum?.refundAmount) || 0;
     const netSales = originalSales + approvedAdjustments - approvedReturns;
 
@@ -132,7 +140,7 @@ export class ReportsService {
       `,
       this.prisma.$queryRaw`
         SELECT DATE_TRUNC('day', ipa."createdAt") AS "day",
-               COALESCE(SUM(ipa."newPrice" - ipa."oldPrice")::numeric, 0)::float AS "total"
+               COALESCE(SUM((ipa."newPrice" - ipa."oldPrice") * COALESCE(ipa."appliedQuantity", 1))::numeric, 0)::float AS "total"
         FROM "InvoicePriceAdjustment" ipa
         JOIN "Invoice" i ON i."id" = ipa."invoiceId"
         WHERE ipa."createdAt" >= ${start} AND ipa."createdAt" < ${end}

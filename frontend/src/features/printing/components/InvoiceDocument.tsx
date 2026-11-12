@@ -86,7 +86,7 @@ interface InvoiceDocumentProps {
 }
 
 /**
- * The 4mm print safe margin is defined once, in PrintDocumentLayout (@page).
+ * The 4mm print safe margin is defined once, in features/printing/print.css (@page).
  * Here the document has zero padding/margin in print so margins are never doubled.
  */
 const INVOICE_PRINT_CSS = `

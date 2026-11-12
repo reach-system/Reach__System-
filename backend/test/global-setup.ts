@@ -5,6 +5,10 @@ const prisma = new PrismaClient();
 
 async function cleanDatabase() {
   const tablenames = [
+    'QuotationEvent',
+    'QuotationItem',
+    'Quotation',
+    'QuotationSequence',
     'StockConsumption',
     'StockAdjustment',
     'InvoicePriceAdjustment',

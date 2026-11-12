@@ -1,7 +1,59 @@
 import { InvoiceChangeRequestsService } from './invoice-change-requests.service';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 
+type MockPriceAdjustment = {
+  newPrice: number;
+  oldPrice?: number;
+  appliedQuantity?: number;
+  createdAt: Date;
+};
+
+type MockInvoiceItemState = {
+  id: number;
+  quantity: number;
+  price: number;
+  productModelId?: number;
+  productModel?: { name: string };
+  priceAdjustments: MockPriceAdjustment[];
+};
+
+type MockReturnItemState = {
+  invoiceItemId: number;
+  quantity: number;
+  productUnitId?: number | null;
+};
+
+type MockInvoiceState = {
+  id: number;
+  invoiceNumber: string;
+  originalTotal: number;
+  currentTotal: number;
+  discountPercentage: number;
+  discountAmount: number;
+  items: MockInvoiceItemState[];
+  returns: { items: MockReturnItemState[] }[];
+};
+
+function invoiceView(state: MockInvoiceState) {
+  return {
+    ...state,
+    customer: { id: 1, name: 'Customer', type: 'CASH', phone: null },
+    employee: { id: 7, name: 'Sales' },
+    items: state.items.map((item) => ({
+      ...item,
+      productModel: item.productModel ?? { name: `model-${item.productModelId ?? item.id}` },
+      priceAdjustments: [...item.priceAdjustments].sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+      ),
+    })),
+    returns: state.returns,
+  };
+}
+
 type MockTx = {
+  $queryRaw: jest.Mock;
+  _state: MockInvoiceState;
+  _nextItemId: number;
   productModel: {
     findFirst: jest.Mock;
     update: jest.Mock;
@@ -27,6 +79,7 @@ type MockTx = {
   };
   invoice: {
     update: jest.Mock;
+    updateMany: jest.Mock;
     findUnique: jest.Mock;
   };
   invoiceReturn: {
@@ -65,7 +118,21 @@ type MockTx = {
 };
 
 function createMockTx(): MockTx {
-  return {
+  const state: MockInvoiceState = {
+    id: 100,
+    invoiceNumber: 'INV-001',
+    originalTotal: 0,
+    currentTotal: 0,
+    discountPercentage: 0,
+    discountAmount: 0,
+    items: [],
+    returns: [],
+  };
+
+  const tx: MockTx = {
+    $queryRaw: jest.fn().mockResolvedValue([{ id: state.id }]),
+    _state: state,
+    _nextItemId: 1000,
     productModel: {
       findFirst: jest.fn(),
       update: jest.fn().mockResolvedValue({}),
@@ -86,23 +153,24 @@ function createMockTx(): MockTx {
       findMany: jest.fn().mockResolvedValue([]),
     },
     invoiceItem: {
-      create: jest.fn().mockResolvedValue({}),
+      create: jest.fn(),
       findUnique: jest.fn(),
     },
     invoice: {
-      update: jest.fn().mockResolvedValue({}),
+      update: jest.fn(),
+      updateMany: jest.fn(),
       findUnique: jest.fn(),
     },
     invoiceReturn: {
-      create: jest.fn().mockResolvedValue({ id: 500 }),
+      create: jest.fn(),
     },
     invoiceReturnItem: {
-      findFirst: jest.fn().mockResolvedValue(null),
-      findMany: jest.fn().mockResolvedValue([]),
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
       updateMany: jest.fn().mockResolvedValue({}),
     },
     invoicePriceAdjustment: {
-      create: jest.fn().mockResolvedValue({ id: 1 }),
+      create: jest.fn(),
     },
     invoiceItemUnitAssignment: {
       findFirst: jest.fn().mockResolvedValue({ id: 1 }),
@@ -127,6 +195,82 @@ function createMockTx(): MockTx {
       findMany: jest.fn().mockResolvedValue([]),
     },
   };
+
+  tx.invoice.findUnique.mockImplementation(async (args: any) =>
+    args?.where?.id === state.id ? invoiceView(state) : null,
+  );
+
+  tx.invoice.update.mockImplementation(async ({ data }: any) => {
+    const next = data?.currentTotal;
+    if (typeof next === 'number') state.currentTotal = next;
+    else if (next?.increment != null) {
+      state.currentTotal = Math.round((state.currentTotal + Number(next.increment)) * 100) / 100;
+    }
+    return {};
+  });
+
+  // Mirrors the compare-and-set used by the service: a lost update returns 0.
+  tx.invoice.updateMany.mockImplementation(async ({ where, data }: any) => {
+    if (Number(where?.currentTotal) !== Number(state.currentTotal)) return { count: 0 };
+    state.currentTotal = Number(data.currentTotal);
+    return { count: 1 };
+  });
+
+  tx.invoiceItem.create.mockImplementation(async ({ data }: any) => {
+    const item: MockInvoiceItemState = {
+      id: tx._nextItemId++,
+      quantity: Number(data.quantity),
+      price: Number(data.price),
+      productModelId: data.productModelId,
+      priceAdjustments: [],
+    };
+    state.items.push(item);
+    return item;
+  });
+
+  tx.invoicePriceAdjustment.create.mockImplementation(async ({ data }: any) => {
+    const item = state.items.find((candidate) => candidate.id === Number(data.invoiceItemId));
+    if (item) {
+      item.priceAdjustments.unshift({
+        oldPrice: Number(data.oldPrice),
+        newPrice: Number(data.newPrice),
+        appliedQuantity: Number(data.appliedQuantity ?? 1),
+        createdAt: new Date(),
+      });
+    }
+    return { id: 1 };
+  });
+
+  tx.invoiceReturn.create.mockImplementation(async ({ data }: any) => {
+    state.returns.push({
+      items: (data.items?.create ?? []).map((item: any) => ({
+        invoiceItemId: Number(item.invoiceItemId),
+        quantity: Number(item.quantity ?? 1),
+        productUnitId: item.productUnitId ?? null,
+      })),
+    });
+    return { id: 500 };
+  });
+
+  tx.invoiceReturnItem.findMany.mockImplementation(async ({ where }: any) =>
+    state.returns
+      .flatMap((invoiceReturn) => invoiceReturn.items)
+      .filter((item) => where?.invoiceItemId == null || item.invoiceItemId === where.invoiceItemId)
+      .map((item) => ({ quantity: item.quantity })),
+  );
+
+  tx.invoiceReturnItem.findFirst.mockImplementation(async ({ where }: any) => {
+    const found = state.returns
+      .flatMap((invoiceReturn) => invoiceReturn.items)
+      .find(
+        (item) =>
+          item.invoiceItemId === where?.invoiceItemId &&
+          (where?.productUnitId == null || item.productUnitId === where.productUnitId),
+      );
+    return found ? { id: 1 } : null;
+  });
+
+  return tx;
 }
 
 function createService(tx: MockTx) {
@@ -162,7 +306,7 @@ function baseRequest(overrides: any = {}) {
 }
 
 describe('InvoiceChangeRequestsService.approveAddItemTransaction (ISS-001/ISS-002)', () => {
-  it('creates InvoiceItem rows and increments currentTotal on approval', async () => {
+  it('creates InvoiceItem rows and recomputes currentTotal on approval', async () => {
     const tx = createMockTx();
     const { service } = createService(tx);
 
@@ -217,11 +361,12 @@ describe('InvoiceChangeRequestsService.approveAddItemTransaction (ISS-001/ISS-00
       data: { invoiceId: 100, productModelId: 1, quantity: 1, price: 30 },
     });
 
-    // ISS-001: currentTotal incremented by Σ price × qty
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
-      data: { currentTotal: { increment: 130 } },
+    // Authoritative total is recomputed from the persisted lines.
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 0 },
+      data: { currentTotal: 130 },
     });
+    expect(tx._state.currentTotal).toBe(130);
 
     // Stock reserved for serialized model
     expect(tx.productModel.update).toHaveBeenCalledWith({
@@ -335,6 +480,7 @@ describe('InvoiceChangeRequestsService.approveAddItemTransaction (ISS-001/ISS-00
     expect(tx.productModel.update).not.toHaveBeenCalled();
     expect(tx.invoiceItem.create).not.toHaveBeenCalled();
     expect(tx.invoice.update).not.toHaveBeenCalled();
+    expect(tx.invoice.updateMany).not.toHaveBeenCalled();
 
     // Request marked rejected with auto-reject note
     expect(tx.invoiceChangeRequest.update).toHaveBeenCalledWith(
@@ -405,10 +551,11 @@ describe('InvoiceChangeRequestsService.approveAddItemTransaction (ISS-001/ISS-00
     expect(tx.invoiceItem.create).toHaveBeenCalledWith({
       data: { invoiceId: 100, productModelId: 9, quantity: 7, price: 4 },
     });
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
-      data: { currentTotal: { increment: 28 } },
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 0 },
+      data: { currentTotal: 28 },
     });
+    expect(tx._state.currentTotal).toBe(28);
   });
 
   it('rejects non-finite proposed price before any mutation', async () => {
@@ -481,34 +628,38 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
     adjustedSubtotal,
     effectivePrice,
     basePrice = effectivePrice,
+    discountPercentage = 0,
+    quantity = 2,
   }: {
     currentTotal: number;
     adjustedSubtotal: number;
     effectivePrice: number;
     basePrice?: number;
+    discountPercentage?: number;
+    quantity?: number;
   }) {
     const tx = createMockTx();
     const { service } = createService(tx);
 
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal,
-      items: [
-        {
-          id: 1,
-          quantity: 2,
-          price: basePrice,
-          priceAdjustments:
-            effectivePrice !== basePrice
-              ? [{ newPrice: effectivePrice, createdAt: new Date('2026-09-01') }]
-              : [],
-        },
-      ],
-    });
+    tx._state.originalTotal = adjustedSubtotal;
+    tx._state.currentTotal = currentTotal;
+    tx._state.discountPercentage = discountPercentage;
+    tx._state.items = [
+      {
+        id: 1,
+        quantity,
+        price: basePrice,
+        priceAdjustments:
+          effectivePrice !== basePrice
+            ? [{ newPrice: effectivePrice, createdAt: new Date('2026-09-01') }]
+            : [],
+      },
+    ];
 
     tx.invoiceItem.findUnique.mockResolvedValue({
       id: 1,
       price: basePrice,
-      quantity: 2,
+      quantity,
       productModelId: 1,
       productModel: { id: 1, name: 'Widget', isSerialized: true },
       unitAssignments: [
@@ -531,7 +682,7 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
       ],
       invoice: {
         id: 100,
-        items: [{ id: 1, quantity: 2 }],
+        items: [{ id: 1, quantity }],
       },
     });
 
@@ -540,19 +691,21 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
     return { tx, service, request, adjustedSubtotal };
   }
 
-  it('scales refund by payment ratio so invoice-level discounts are allocated proportionally', async () => {
-    // List subtotal 200, customer paid 180 (10% off). Return 1 of 2 units at list 100.
+  it('allocates invoice-level discounts proportionally using a stable factor', async () => {
+    // List subtotal 200, 10% invoice discount → customer owes 180. Return 1 of 2 units at list 100.
     const { tx, service, request } = setupReturnScenario({
       currentTotal: 180,
       adjustedSubtotal: 200,
       effectivePrice: 100,
+      discountPercentage: 10,
     });
 
     const access: any = service as any;
     const result = await access.approveReturnTransaction(request, 99, 'ok');
 
-    // paymentRatio = 180/200 = 0.9 → refund = 100 × 0.9 = 90 (not base 100)
+    // discountFactor = 180/200 = 0.9 → refund = 100 × 0.9 = 90 (not base 100)
     expect(result.refundTotal).toBe(90);
+    expect(result.newTotal).toBe(90);
     expect(tx.invoiceReturn.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -565,8 +718,8 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
         }),
       }),
     );
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 180 },
       data: { currentTotal: 90 },
     });
   });
@@ -595,8 +748,8 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
     );
   });
 
-  it('floors currentTotal at 0 when the discount-aware refund exceeds it (ISS-022)', async () => {
-    // Odd state: currentTotal already drifted below a single unit's share.
+  it('recomputes from persisted lines even when currentTotal had drifted (ISS-022)', async () => {
+    // Corrupted invoice: currentTotal no longer matches its lines.
     const { tx, service, request } = setupReturnScenario({
       currentTotal: 10,
       adjustedSubtotal: 200,
@@ -606,55 +759,15 @@ describe('InvoiceChangeRequestsService.approveReturnTransaction (ISS-004/ISS-022
     const access: any = service as any;
     const result = await access.approveReturnTransaction(request, 99, 'ok');
 
-    // ratio = 10/200 = 0.05 → refund = 5; 10 - 5 = 5 (still positive here)
-    expect(result.refundTotal).toBe(5);
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
-      data: { currentTotal: 5 },
+    // Remaining 1 unit × 100 = 100. The old drifted value is replaced, not
+    // decremented yet further.
+    expect(result.refundTotal).toBe(100);
+    expect(result.newTotal).toBe(100);
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 10 },
+      data: { currentTotal: 100 },
     });
-
-    // Hard floor case: ratio forces refund == currentTotal after rounding drift
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal: 3,
-      items: [
-        {
-          id: 1,
-          quantity: 2,
-          price: 100,
-          priceAdjustments: [],
-        },
-      ],
-    });
-    tx.invoiceItem.findUnique.mockResolvedValue({
-      id: 1,
-      price: 100,
-      quantity: 2,
-      productModelId: 1,
-      productModel: { id: 1, name: 'Widget', isSerialized: true },
-      unitAssignments: [
-        {
-          id: 11,
-          productUnitId: 902,
-          productUnit: { id: 902, status: 'SOLD', version: 1, barcode: 'BC-2' },
-        },
-      ],
-    });
-    tx.invoiceReturnItem.findFirst.mockResolvedValue(null);
-    tx.productUnit.updateMany.mockResolvedValue({ count: 1 });
-
-    const request2 = baseRequest({
-      items: [
-        { id: 2, action: 'RETURN_ITEM', invoiceItemId: 1, productUnitId: 902 },
-      ],
-      invoice: { id: 100, items: [{ id: 1, quantity: 2 }] },
-    });
-    tx.invoiceChangeRequest.findUnique.mockResolvedValue(request2);
-
-    const result2 = await access.approveReturnTransaction(request2, 99, 'ok');
-    // ratio = 3/200 = 0.015 → refund = 1.5; total would be 1.5, floored path still ≥ 0
-    expect(result2.refundTotal).toBe(1.5);
-    const lastUpdate = tx.invoice.update.mock.calls[tx.invoice.update.mock.calls.length - 1];
-    expect(lastUpdate[0].data.currentTotal).toBeGreaterThanOrEqual(0);
+    expect(tx._state.currentTotal).toBe(100);
   });
 
   it('blocks returning the same productUnitId twice but allows a different unit of the same line (ISS-005)', async () => {
@@ -699,10 +812,12 @@ describe('InvoiceChangeRequestsService � non-serialized quantity returns (Fix 
     const tx = createMockTx();
     const { service } = createService(tx);
 
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal: 100 * lineQuantity,
-      items: [{ id: 1, quantity: lineQuantity, price: 100, priceAdjustments: [] }],
-    });
+    tx._state.originalTotal = 100 * lineQuantity;
+    tx._state.currentTotal = 100 * lineQuantity;
+    tx._state.items = [{ id: 1, quantity: lineQuantity, price: 100, priceAdjustments: [] }];
+    tx._state.returns = priorReturns.map((row) => ({
+      items: [{ invoiceItemId: 1, quantity: row.quantity }],
+    }));
     tx.invoiceItem.findUnique.mockResolvedValue({
       id: 1,
       price: 100,
@@ -711,7 +826,6 @@ describe('InvoiceChangeRequestsService � non-serialized quantity returns (Fix 
       productModel: { id: 77, name: 'Bulk', isSerialized: false },
       unitAssignments: [],
     });
-    tx.invoiceReturnItem.findMany.mockResolvedValue(priorReturns);
     tx.stockConsumption.findMany.mockResolvedValue(consumptions.map((c) => ({ ...c })));
     tx.stockLot.findUnique.mockResolvedValue({ id: 5, quantityRemaining: 0, quantityReserved: 0 });
 
@@ -756,10 +870,16 @@ describe('InvoiceChangeRequestsService � non-serialized quantity returns (Fix 
     expect(tx.invoiceItemUnitAssignment.update).not.toHaveBeenCalled();
     expect(tx.productUnitAuditLog.create).not.toHaveBeenCalled();
 
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 300 },
       data: { currentTotal: 0 },
     });
+    // Full return closes the invoice.
+    expect(tx.invoice.update).toHaveBeenCalledWith({
+      where: { id: 100 },
+      data: { status: 'CANCELLED' },
+    });
+    expect(tx._state.currentTotal).toBe(0);
   });
 
   it('supports partial quantity returns of a non-serialized line', async () => {
@@ -780,10 +900,13 @@ describe('InvoiceChangeRequestsService � non-serialized quantity returns (Fix 
       where: { id: 5 },
       data: { quantityRemaining: { increment: 2 } },
     });
-    expect(tx.invoice.update).toHaveBeenCalledWith({
-      where: { id: 100 },
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 300 },
       data: { currentTotal: 100 },
     });
+    // Still has outstanding quantity, so the invoice stays active.
+    expect(tx.invoice.update).not.toHaveBeenCalled();
+    expect(tx._state.currentTotal).toBe(100);
   });
 
   it('rejects over-returning a non-serialized line', async () => {
@@ -863,13 +986,13 @@ describe('InvoiceChangeRequestsService.approve � mixed-action requests (Fix 1)
     const tx = createMockTx();
     const { service } = createService(tx);
 
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal: 150,
-      items: [
-        { id: 1, quantity: 2, price: 50, priceAdjustments: [] },
-        { id: 2, quantity: 1, price: 100, priceAdjustments: [] },
-      ],
-    });
+    tx._state.originalTotal = 200;
+    tx._state.currentTotal = 150;
+    tx._state.discountPercentage = 25;
+    tx._state.items = [
+      { id: 1, quantity: 2, price: 50, priceAdjustments: [] },
+      { id: 2, quantity: 1, price: 100, priceAdjustments: [] },
+    ];
     tx.invoiceItem.findUnique
       .mockResolvedValueOnce({
         id: 1,
@@ -902,27 +1025,35 @@ describe('InvoiceChangeRequestsService.approve � mixed-action requests (Fix 1)
     const result: any = await service.approve(10, 99, 'both ok');
 
     expect(result.status).toBe('APPROVED');
-    // Return group: 50 � (150/200) = 37.5, unit released
+    // Return group: 50 × (150/200) = 37.5, unit released
     expect(result.refundTotal).toBe(37.5);
     expect(result.itemsReturned).toBe(1);
     expect(tx.productUnit.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: 'AVAILABLE' }) }),
     );
 
-    // Price group: 100 ? 80 (?20)
-    expect(result.totalDelta).toBe(-20);
+    // Price group: 100 → 80 on 1 outstanding unit, under the same 25% discount.
+    // (50 + 80) × 0.75 = 97.5, so the price group changed the total by -15.
+    expect(result.totalDelta).toBe(-15);
     expect(result.itemsAdjusted).toBe(1);
+    expect(result.newTotal).toBe(97.5);
     expect(tx.invoicePriceAdjustment.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ invoiceItemId: 2, oldPrice: 100, newPrice: 80 }),
+        data: expect.objectContaining({
+          invoiceItemId: 2,
+          oldPrice: 100,
+          newPrice: 80,
+          appliedQuantity: 1,
+        }),
       }),
     );
 
-    // Return sets the absolute total first, then the price group applies its delta
-    const updates = tx.invoice.update.mock.calls.map((c: any[]) => c[0]);
-    expect(updates[0].data).toEqual({ currentTotal: 112.5 });
-    expect(updates[1].data).toEqual({ currentTotal: { increment: -20 } });
-
+    // One authoritative CAS write for the whole approval.
+    expect(tx.invoice.updateMany).toHaveBeenCalledTimes(1);
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 150 },
+      data: { currentTotal: 97.5 },
+    });
     // One audit entry per group, both from the same approval
     expect(tx.invoiceAuditLog.create).toHaveBeenCalledTimes(2);
   });
@@ -931,10 +1062,9 @@ describe('InvoiceChangeRequestsService.approve � mixed-action requests (Fix 1)
     const tx = createMockTx();
     const { service } = createService(tx);
 
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal: 100,
-      items: [{ id: 1, quantity: 1, price: 100, priceAdjustments: [] }],
-    });
+    tx._state.originalTotal = 100;
+    tx._state.currentTotal = 100;
+    tx._state.items = [{ id: 1, quantity: 1, price: 100, priceAdjustments: [] }];
     tx.invoiceItem.findUnique.mockResolvedValue({
       id: 1,
       price: 100,
@@ -982,10 +1112,9 @@ describe('InvoiceChangeRequestsService.approve � mixed-action requests (Fix 1)
     const tx = createMockTx();
     const { service } = createService(tx);
 
-    tx.invoice.findUnique.mockResolvedValue({
-      currentTotal: 100,
-      items: [{ id: 1, quantity: 1, price: 100, priceAdjustments: [] }],
-    });
+    tx._state.originalTotal = 100;
+    tx._state.currentTotal = 100;
+    tx._state.items = [{ id: 1, quantity: 1, price: 100, priceAdjustments: [] }];
     tx.invoiceItem.findUnique.mockResolvedValue({
       id: 1,
       price: 100,
@@ -1079,6 +1208,189 @@ describe('InvoiceChangeRequestsService.approve � mixed-action requests (Fix 1)
       response: expect.objectContaining({ code: 'INVALID_REQUEST' }),
     });
     expect(tx.invoiceChangeRequest.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('InvoiceChangeRequestsService price changes (quantity-aware)', () => {
+  function setupPriceScenario({
+    quantity = 3,
+    price = 450,
+    proposedPrice = 440,
+    currentTotal,
+    discountPercentage = 0,
+    existingAdjustment,
+    returns = [],
+  }: {
+    quantity?: number;
+    price?: number;
+    proposedPrice?: number;
+    currentTotal?: number;
+    discountPercentage?: number;
+    existingAdjustment?: { newPrice: number; appliedQuantity?: number };
+    returns?: { invoiceItemId: number; quantity: number }[];
+  } = {}) {
+    const tx = createMockTx();
+    const { service } = createService(tx);
+
+    tx._state.originalTotal = price * quantity;
+    tx._state.currentTotal = currentTotal ?? price * quantity;
+    tx._state.discountPercentage = discountPercentage;
+    tx._state.items = [
+      {
+        id: 1,
+        quantity,
+        price,
+        priceAdjustments: existingAdjustment
+          ? [{ ...existingAdjustment, createdAt: new Date('2026-10-01') }]
+          : [],
+      },
+    ];
+    tx._state.returns = returns.map((row) => ({ items: [row] }));
+
+    const request = baseRequest({
+      items: [{ id: 1, action: 'CHANGE_PRICE', invoiceItemId: 1, proposedPrice }],
+      invoice: { id: 100, items: [{ id: 1, quantity }] },
+    });
+    tx.invoiceChangeRequest.findUnique.mockResolvedValue(request);
+    return { tx, service, request };
+  }
+
+  it('applies 450 → 440 to every outstanding unit (qty 3)', async () => {
+    const { tx, service, request } = setupPriceScenario();
+
+    const access: any = service as any;
+    const result = await access.approvePriceChangeTransaction(request, 99, 'ok');
+
+    // The old code deducted 10 once (1 × delta) instead of 30 (3 × delta).
+    expect(result.totalDelta).toBe(-30);
+    expect(result.newTotal).toBe(1320);
+    expect(tx._state.currentTotal).toBe(1320);
+
+    expect(tx.invoicePriceAdjustment.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        invoiceItemId: 1,
+        oldPrice: 450,
+        newPrice: 440,
+        appliedQuantity: 3,
+      }),
+    });
+    expect(tx.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: 100, currentTotal: 1350 },
+      data: { currentTotal: 1320 },
+    });
+
+    const audit = tx.invoiceAuditLog.create.mock.calls[0][0];
+    expect(audit.data.action).toBe('PRICE_ADJUSTED');
+    expect(audit.data.details).toMatchObject({ delta: -30, newTotal: 1320 });
+  });
+
+  it('honours the invoice discount factor when repricing', async () => {
+    // Subtotal 1350, 10% discount → receivable 1215.
+    const { tx, service, request } = setupPriceScenario({
+      currentTotal: 1215,
+      discountPercentage: 10,
+    });
+
+    const access: any = service as any;
+    const result = await access.approvePriceChangeTransaction(request, 99, 'ok');
+
+    // (450 − 440) × 3 × 0.9 = 27
+    expect(result.totalDelta).toBe(-27);
+    expect(result.newTotal).toBe(1188);
+    expect(tx._state.currentTotal).toBe(1188);
+  });
+
+  it('uses the latest adjustment as the old price for a repeated change', async () => {
+    const { tx, service, request } = setupPriceScenario({
+      currentTotal: 1320,
+      existingAdjustment: { newPrice: 440, appliedQuantity: 3 },
+      proposedPrice: 430,
+    });
+
+    const access: any = service as any;
+    const result = await access.approvePriceChangeTransaction(request, 99, 'ok');
+
+    expect(result.totalDelta).toBe(-30);
+    expect(result.newTotal).toBe(1290);
+    expect(tx.invoicePriceAdjustment.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ oldPrice: 440, newPrice: 430, appliedQuantity: 3 }),
+    });
+  });
+
+  it('rejects repricing a fully returned line', async () => {
+    const { tx, service, request } = setupPriceScenario({
+      currentTotal: 0,
+      returns: [{ invoiceItemId: 1, quantity: 3 }],
+    });
+
+    const access: any = service as any;
+    await expect(access.approvePriceChangeTransaction(request, 99, 'ok')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'INVOICE_ITEM_FULLY_RETURNED' }),
+    });
+    expect(tx.invoicePriceAdjustment.create).not.toHaveBeenCalled();
+    expect(tx.invoice.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects more than one price row for the same line in a request', async () => {
+    const { tx, service, request } = setupPriceScenario();
+    request.items = [
+      { id: 1, action: 'CHANGE_PRICE', invoiceItemId: 1, proposedPrice: 440 },
+      { id: 2, action: 'CHANGE_PRICE', invoiceItemId: 1, proposedPrice: 430 },
+    ] as any;
+
+    const access: any = service as any;
+    await expect(access.approvePriceChangeTransaction(request, 99, 'ok')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'DUPLICATE_PRICE_CHANGE' }),
+    });
+    expect(tx.invoicePriceAdjustment.create).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 when the invoice total changed between read and write', async () => {
+    const { tx, service, request } = setupPriceScenario();
+    tx.invoice.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    const access: any = service as any;
+    await expect(access.approvePriceChangeTransaction(request, 99, 'ok')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'INVOICE_CONCURRENTLY_MODIFIED' }),
+    });
+  });
+
+  it('handles a returned quantity and a price change in the same request', async () => {
+    const tx = createMockTx();
+    const { service } = createService(tx);
+
+    tx._state.originalTotal = 1350;
+    tx._state.currentTotal = 1350;
+    tx._state.items = [{ id: 1, quantity: 3, price: 450, priceAdjustments: [] }];
+    tx.invoiceItem.findUnique.mockResolvedValue({
+      id: 1,
+      price: 450,
+      quantity: 3,
+      productModelId: 77,
+      productModel: { id: 77, name: 'Bulk', isSerialized: false },
+      unitAssignments: [],
+    });
+    tx.stockConsumption.findMany.mockResolvedValue([{ stockLotId: 5, quantity: 3 }]);
+    tx.stockLot.findUnique.mockResolvedValue({ id: 5, quantityRemaining: 0, quantityReserved: 0 });
+
+    const request = baseRequest({
+      items: [
+        { id: 1, action: 'RETURN_ITEM', invoiceItemId: 1, quantity: 1 },
+        { id: 2, action: 'CHANGE_PRICE', invoiceItemId: 1, proposedPrice: 440 },
+      ],
+      invoice: { id: 100, items: [{ id: 1, quantity: 3 }] },
+    });
+    tx.invoiceChangeRequest.findUnique.mockResolvedValue(request);
+
+    const result: any = await service.approve(10, 99, 'return + price');
+
+    expect(result.refundTotal).toBe(450);
+    // Price applies to the 2 units still outstanding, not the returned one.
+    expect(tx.invoicePriceAdjustment.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ oldPrice: 450, newPrice: 440, appliedQuantity: 2 }),
+    });
+    expect(result.newTotal).toBe(880);
+    expect(tx._state.currentTotal).toBe(880);
   });
 });
 

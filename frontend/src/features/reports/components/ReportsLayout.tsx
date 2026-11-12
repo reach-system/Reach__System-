@@ -20,6 +20,14 @@ export default function ReportsLayout() {
     { to: `${basePath}/customers`, label: t.reports.customerReport || "Customer Report" },
     { to: `${basePath}/suppliers`, label: t.reports.supplierReport || "Supplier Report" },
     { to: `${basePath}/inventory`, label: t.reports.inventoryReport || "Inventory" },
+    ...(isAccountant
+      ? []
+      : [
+          {
+            to: `${basePath}/quotations`,
+            label: t.quotationReport.title || "Quotation Report",
+          },
+        ]),
   ];
 
   const navItems = isAccountant

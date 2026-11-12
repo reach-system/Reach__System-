@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, ParseIntPipe } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, ParseIntPipe, Request } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { ProductModelsService } from './product-models.service';
@@ -7,6 +7,7 @@ import { UpdateProductModelDto } from './dto/update-product-model.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { RequestWithUser } from '../common/types/request-with-user.interface';
 
 @ApiTags('Product Models')
 @ApiBearerAuth()
@@ -36,6 +37,47 @@ export class ProductModelsController {
       page: page ? parseInt(page, 10) : 1,
       limit: limit ? parseInt(limit, 10) : 25,
     });
+  }
+
+  @Get('last-prices')
+  @Roles(Role.ADMIN, Role.SALES)
+  @ApiOperation({ summary: 'List product last prices (Admin and Sales)' })
+  async getLastPrices(
+    @Query('categoryId') categoryId?: string,
+    @Query('search') search?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('includeWithoutPrice') includeWithoutPrice?: string,
+  ) {
+    return this.productModelsService.getLastPriceList({
+      categoryId: categoryId ? Number(categoryId) : undefined,
+      search,
+      page: page ? Number(page) : 1,
+      limit: limit ? Number(limit) : 25,
+      includeWithoutPrice: includeWithoutPrice !== 'false',
+    });
+  }
+
+  @Patch(':id/last-price')
+  @Roles(Role.ADMIN, Role.SALES)
+  @ApiOperation({ summary: 'Set or clear a manual last price for a product' })
+  async setLastPrice(
+    @Param('id', ParseIntPipe) id: number,
+    @Request() req: RequestWithUser,
+    @Body() body: { price?: number | null; version?: number },
+  ) {
+    return this.productModelsService.setManualLastPrice(id, req.user.sub, body.price ?? null, body.version);
+  }
+
+  @Delete(':id/last-price')
+  @Roles(Role.ADMIN, Role.SALES)
+  @ApiOperation({ summary: 'Clear a product last price' })
+  async clearLastPrice(
+    @Param('id', ParseIntPipe) id: number,
+    @Request() req: RequestWithUser,
+    @Body() body: { version?: number } = {},
+  ) {
+    return this.productModelsService.setManualLastPrice(id, req.user.sub, null, body.version);
   }
 
   @Get(':id')

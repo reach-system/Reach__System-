@@ -7,6 +7,10 @@ export const testPrisma = prisma;
 
 export async function cleanDatabase() {
   const tablenames = [
+    'QuotationEvent',
+    'QuotationItem',
+    'Quotation',
+    'QuotationSequence',
     'StockConsumption',
     'StockAdjustment',
     'InvoicePriceAdjustment',

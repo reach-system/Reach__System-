@@ -73,6 +73,7 @@ export interface ProductModel {
   name: string;
   categoryId: number;
   category?: Category;
+  lastPrice?: { price: number } | null;
   minStockAlert: number;
   isSerialized: boolean;
   unit?: UnitOfMeasure;
@@ -123,6 +124,17 @@ export interface ProductUnitAuditEntry {
   timestamp: string;
 }
 
+export interface InvoicePriceAdjustment {
+  id: number;
+  invoiceId?: number;
+  invoiceItemId?: number;
+  oldPrice: number;
+  newPrice: number;
+  appliedQuantity?: number;
+  reason?: string;
+  createdAt: string;
+}
+
 export interface InvoiceItem {
   id: number;
   invoiceId: number;
@@ -135,6 +147,7 @@ export interface InvoiceItem {
     reversedAt?: string | null;
     productUnit?: Pick<ProductUnit, "id" | "barcode" | "status">;
   }[];
+  priceAdjustments?: InvoicePriceAdjustment[];
   quantity?: number;
   costAtSale?: number;
   price: number;
@@ -157,6 +170,8 @@ export interface Invoice {
   originalTotal: number;
   currentTotal: number;
   items: InvoiceItem[];
+  priceAdjustments?: InvoicePriceAdjustment[];
+  returns?: InvoiceReturn[];
   confirmedByEmployeeId?: number;
   confirmedBy?: Employee;
   confirmedAt?: string;
@@ -341,6 +356,7 @@ export interface InvoiceReturnItem {
   invoiceItemId: number;
   productUnitId: number;
   productUnit?: ProductUnit;
+  quantity?: number;
   refundAmount: number;
 }
 
@@ -445,3 +461,146 @@ export interface PaginatedResponse<T> {
 }
 
 export * from "./reports";
+
+export type QuotationStatus =
+  | "DRAFT"
+  | "SENT"
+  | "ACCEPTED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "CONVERTED";
+
+export type QuotationEventType =
+  | "CREATED"
+  | "UPDATED"
+  | "SENT"
+  | "ACCEPTED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "REVISED"
+  | "CONVERTED"
+  | "DELETED";
+
+export interface QuotationItem {
+  id: number;
+  quotationId: number;
+  productModelId: number;
+  /** Snapshot of the catalogue name at quote time. */
+  productName: string;
+  categoryName: string | null;
+  unit: string;
+  quantity: number;
+  price: number;
+  lineDiscount: number;
+  createdAt: string;
+}
+
+export interface QuotationEvent {
+  id: number;
+  quotationId: number;
+  type: QuotationEventType;
+  actorId: number | null;
+  actor?: Pick<Employee, "id" | "name" | "role"> | null;
+  message: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface QuotationRef {
+  id: number;
+  quotationNumber: string;
+  status: QuotationStatus;
+  date: string;
+  total?: number;
+}
+
+export interface QuotationConvertedInvoice {
+  id: number;
+  invoiceNumber: string;
+  status: InvoiceStatus;
+  date: string;
+  currentTotal: number;
+}
+
+export interface Quotation {
+  id: number;
+  quotationNumber: string;
+  customerId: number;
+  customer?: Pick<Customer, "id" | "name" | "phone"> | null;
+  createdById: number;
+  createdBy?: Pick<Employee, "id" | "name" | "role"> | null;
+  status: QuotationStatus;
+  /** SENT + past validity is reported as EXPIRED even before the sweep runs. */
+  effectiveStatus: QuotationStatus;
+  isExpired: boolean;
+  date: string;
+  validUntil: string;
+  customerName: string;
+  customerPhone: string | null;
+  notes: string | null;
+  subtotal: number;
+  lineDiscountTotal: number;
+  discountPercentage: number;
+  discountAmount: number;
+  total: number;
+  sentAt: string | null;
+  acceptedAt: string | null;
+  rejectedAt: string | null;
+  rejectedReason: string | null;
+  convertedAt: string | null;
+  convertedInvoiceId: number | null;
+  convertedInvoice?: QuotationConvertedInvoice | null;
+  revisedFromId: number | null;
+  revisedFrom?: QuotationRef | null;
+  revisions?: QuotationRef[];
+  items: QuotationItem[];
+  events?: QuotationEvent[];
+  itemCount?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QuotationListMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  truncated?: boolean;
+}
+
+export interface QuotationListResponse {
+  data: Quotation[];
+  meta: QuotationListMeta;
+}
+
+export interface QuotationStatusRow {
+  status: QuotationStatus;
+  count: number;
+  value: number;
+}
+
+export interface QuotationSalespersonRow {
+  employeeId: number;
+  employeeName: string;
+  count: number;
+  quotedValue: number;
+  convertedCount: number;
+  convertedValue: number;
+  conversionRate: number;
+}
+
+export interface QuotationReportResponse {
+  from: string;
+  to: string;
+  generatedAt: string;
+  summary: {
+    totalCount: number;
+    quotedValue: number;
+    convertedCount: number;
+    convertedValue: number;
+    conversionRate: number;
+    averageValue: number;
+  };
+  byStatus: QuotationStatusRow[];
+  bySalesperson: QuotationSalespersonRow[];
+}

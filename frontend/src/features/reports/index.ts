@@ -9,4 +9,5 @@ export { default as ReturnsReportPage } from "./pages/ReturnsReportPage";
 export { default as CustomerReportPage } from "./pages/CustomerReportPage";
 export { default as SupplierReportPage } from "./pages/SupplierReportPage";
 export { default as InventoryReportPage } from "./pages/InventoryReportPage";
+export { default as QuotationsReportPage } from "./pages/QuotationsReportPage";
 export type * from "./types";

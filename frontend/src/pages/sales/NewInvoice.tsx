@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import type { CSSProperties } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { isAxiosError } from "axios";
 import api from "../../lib/api";
 import { useAuth } from "../../lib/auth";
@@ -15,7 +15,9 @@ import { Select } from "../../components/ui/Select";
 import { useI18n } from "../../i18n/context";
 import { ALL_OPTIONS_LIMIT, useCustomerOptions, useInvalidateOptions } from "../../hooks";
 import { INVOICE_NOTE_MAX_LENGTH } from "../../lib/constants";
-import type { Customer, ProductModel } from "../../types";
+import { calculateInvoiceTotals, roundMoney } from "../../lib/invoiceTotals";
+import { quotationConversionDiscount } from "../../lib/quotationTotals";
+import type { Customer, ProductModel, Quotation, UnitOfMeasure } from "../../types";
 
 // ---------- types ----------
 type ModelWithCategory = ProductModel & { category?: { id: number; name: string } | null };
@@ -105,9 +107,9 @@ const isValidPercentage = (v: string) =>
 
 const isValidAmount = (v: string) => v.trim() === "" || (Number.isFinite(Number(v)) && Number(v) >= 0);
 
-// Money math in floats drifts (0.1 + 0.2 !== 0.3), so round every money result to 2 decimals.
-const round2 = (n: number) => Math.round(n * 100) / 100;
-const money = (n: number) => round2(n).toFixed(2);
+// Money math in floats drifts (0.1 + 0.2 !== 0.3), so all money goes through roundMoney.
+const round2 = roundMoney;
+const money = (n: number) => roundMoney(n).toFixed(2);
 
 // ---------- small presentational pieces ----------
 function SummaryRow({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
@@ -130,10 +132,24 @@ function SummaryRow({ label, value, muted }: { label: string; value: string; mut
 
 export default function NewInvoice() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { user } = useAuth();
   const { t } = useI18n();
   const SUCCESS_MESSAGES = useMemo(() => getSuccessMessages(t), [t]);
   const lineSeq = useRef(0);
+  const fromQuotationParam = searchParams.get("fromQuotationId");
+  const fromQuotationId = fromQuotationParam ? Number(fromQuotationParam) : null;
+
+  // Conversion flow: the quotation is loaded here, but the backend remains
+  // authoritative and re-validates status, expiry, customer and exact lines
+  // inside the invoice transaction.
+  const [conversionQuotation, setConversionQuotation] =
+    useState<Quotation | null>(null);
+  const [conversionLoading, setConversionLoading] = useState(
+    fromQuotationId !== null,
+  );
+  const [conversionError, setConversionError] = useState<string | null>(null);
+  const conversionPrefilled = useRef<number | null>(null);
 
   // customer
   const [selectedCustomerId, setSelectedCustomerId] = useState<number | null>(null);
@@ -184,9 +200,12 @@ export default function NewInvoice() {
         const payload = res.data?.data ?? res.data;
         setAllModels(Array.isArray(payload) ? payload : []);
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (signal.aborted) return;
+        setFormError(getFriendlyErrorMessage(err, t, t.errors.common.connectionIssue));
+      });
     return () => controller.abort();
-  }, []);
+  }, [t]);
 
   // Auto-clear the form error (with cleanup)
   useEffect(() => {
@@ -194,6 +213,122 @@ export default function NewInvoice() {
     const id = setTimeout(() => setFormError(null), 6000);
     return () => clearTimeout(id);
   }, [formError]);
+
+  // ---------- quotation conversion prefill ----------
+  useEffect(() => {
+    if (fromQuotationId === null) return;
+    if (!Number.isFinite(fromQuotationId) || fromQuotationId <= 0) {
+      setConversionError(t.quotations.conversion.loadFailed);
+      setConversionLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setConversionLoading(true);
+    setConversionError(null);
+
+    api
+      .get<Quotation>(`/quotations/${fromQuotationId}`, {
+        signal: controller.signal,
+      })
+      .then(({ data }) => {
+        if (controller.signal.aborted) return;
+
+        const status = data.effectiveStatus ?? data.status;
+        if (status !== "SENT" && status !== "ACCEPTED") {
+          setConversionError(t.quotations.conversion.invalidStatus);
+          return;
+        }
+        if (data.isExpired || new Date(data.validUntil).getTime() < Date.now()) {
+          setConversionError(t.quotations.conversion.expired);
+          return;
+        }
+        setConversionQuotation(data);
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        if (isAxiosError(err) && err.response?.status === 404) {
+          setConversionError(t.quotations.conversion.loadFailed);
+        } else {
+          setConversionError(
+            getFriendlyErrorMessage(err, t, t.errors.common.connectionIssue),
+          );
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setConversionLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [fromQuotationId, t]);
+
+  // Apply the prefill exactly once per quotation. Editing models afterwards
+  // must never overwrite what the user has already adjusted.
+  useEffect(() => {
+    if (!conversionQuotation) return;
+    if (conversionPrefilled.current === conversionQuotation.id) return;
+    conversionPrefilled.current = conversionQuotation.id;
+
+    setSelectedCustomerId(conversionQuotation.customerId);
+    setSelectedCustomer({
+      id: conversionQuotation.customerId,
+      name: conversionQuotation.customerName,
+      phone: conversionQuotation.customerPhone ?? undefined,
+      type: "INDIVIDUAL",
+      isActive: true,
+      deletedAt: null,
+      createdAt: conversionQuotation.createdAt,
+    });
+    setCustomerSearch(conversionQuotation.customerName);
+    setShowCustomerDropdown(false);
+
+    setLines(
+      conversionQuotation.items.map((item) => {
+        const knownModel = allModels.find(
+          (model) => model.id === item.productModelId,
+        );
+        const unit: UnitOfMeasure =
+          item.unit === "METER" ? "METER" : "PIECE";
+        const fallbackModel: ProductModel = {
+          id: item.productModelId,
+          name: item.productName,
+          categoryId: 0,
+          minStockAlert: 0,
+          isSerialized: false,
+          unit,
+          isActive: true,
+          deletedAt: null,
+          createdAt: conversionQuotation.createdAt,
+        };
+
+        return {
+          id: `quotation-${item.id}`,
+          model: knownModel ?? fallbackModel,
+          quantity: Number(item.quantity),
+          price: Number(item.price),
+        };
+      }),
+    );
+
+    // Collapse every quotation discount into the invoice's fixed discount so
+    // the invoice total equals the quoted total exactly.
+    const collapsedDiscount = quotationConversionDiscount({
+      subtotal: Number(conversionQuotation.subtotal),
+      lineDiscountTotal: Number(conversionQuotation.lineDiscountTotal),
+      discountPercentage: Number(conversionQuotation.discountPercentage),
+      discountAmount: Number(conversionQuotation.discountAmount),
+    });
+    setDiscountPercentage("");
+    setDiscountAmount(
+      collapsedDiscount > 0 ? collapsedDiscount.toFixed(2) : "",
+    );
+    setInvoiceNote(conversionQuotation.notes ?? "");
+  }, [conversionQuotation, allModels]);
+
+  // A failed conversion must not be saved as a normal invoice: that would
+  // consume an invoice number without claiming the quotation.
+  const conversionBlocked =
+    fromQuotationId !== null && !conversionQuotation;
 
   // Keep the selected customer object fresh when options reload
   useEffect(() => {
@@ -221,19 +356,19 @@ export default function NewInvoice() {
 
   // Display-only totals. The backend must recompute these and never trust the client values.
   const { subtotal, parsedPercentage, percentageDiscount, fixedDiscount, totalDiscount, total } = useMemo(() => {
-    const sub = round2(lines.reduce((sum, l) => sum + l.price * l.quantity, 0));
     const pct = Math.max(0, Math.min(Number(discountPercentage) || 0, 100));
-    const pctDiscount = round2((pct / 100) * sub);
-    // The fixed discount can only take what is LEFT after the percentage discount,
-    // otherwise the two discounts together could exceed the subtotal.
-    const fixed = round2(Math.max(0, Math.min(Number(discountAmount) || 0, sub - pctDiscount)));
+    const totals = calculateInvoiceTotals(
+      lines.map((line) => ({ price: line.price, quantity: line.quantity })),
+      pct,
+      Number(discountAmount) || 0,
+    );
     return {
-      subtotal: sub,
+      subtotal: totals.subtotal,
       parsedPercentage: pct,
-      percentageDiscount: pctDiscount,
-      fixedDiscount: fixed,
-      totalDiscount: round2(pctDiscount + fixed),
-      total: round2(Math.max(0, sub - pctDiscount - fixed)),
+      percentageDiscount: totals.percentageDiscount,
+      fixedDiscount: totals.fixedDiscount,
+      totalDiscount: roundMoney(totals.percentageDiscount + totals.fixedDiscount),
+      total: totals.total,
     };
   }, [lines, discountPercentage, discountAmount]);
 
@@ -242,6 +377,7 @@ export default function NewInvoice() {
   const discountAmountValid = isValidAmount(discountAmount);
 
   const canSave =
+    !conversionBlocked &&
     selectedCustomerId !== null &&
     lines.length > 0 &&
     lines.every((l) => l.quantity > 0 && (l.price > 0 || isPriceOptional(l.model))) &&
@@ -347,10 +483,19 @@ export default function NewInvoice() {
     setFormError(null);
     setSavedInvoiceNumber(null);
     setSavedInvoiceId(null);
-  }, []);
+    // A converted quotation can only produce one invoice. Leave the prefilled
+    // URL so the next invoice does not carry fromQuotationId again.
+    if (fromQuotationId !== null) {
+      navigate(
+        user?.role === "ADMIN" ? "/admin/new-invoice" : "/sales/new-invoice",
+        { replace: true },
+      );
+    }
+  }, [fromQuotationId, navigate, user?.role]);
 
   const handleSave = async () => {
     if (saving || savedInvoiceId !== null) return; // blocks double-click / re-save
+    if (conversionBlocked) return;
     if (invoiceNote.trim().length > NOTE_MAX_LENGTH) {
       const msg = t.errors.common.noteMaxLength.replace("{n}", String(NOTE_MAX_LENGTH));
       setFormError(msg);
@@ -363,6 +508,7 @@ export default function NewInvoice() {
     try {
       const { data } = await api.post("/invoices", {
         customerId: selectedCustomerId,
+        fromQuotationId: conversionQuotation?.id,
         paymentType,
         note: invoiceNote.trim() || undefined,
         discountPercentage: parsedPercentage || undefined,
@@ -402,6 +548,67 @@ export default function NewInvoice() {
     <div className="flex flex-col lg:flex-row gap-4" style={{ alignItems: "flex-start" }}>
       {/* LEFT PANEL: inputs */}
       <div style={{ flex: 1, minWidth: 0, width: "100%", display: "flex", flexDirection: "column", gap: "16px" }}>
+        {/* Quotation conversion context */}
+        {fromQuotationId !== null && (
+          <Card
+            style={{
+              borderColor: conversionError ? "var(--accent)" : "var(--brand)",
+              backgroundColor: conversionError ? "var(--accent-bg)" : "var(--brand-bg)",
+            }}
+          >
+            <div role={conversionError ? "alert" : "status"}>
+              {conversionLoading && !conversionQuotation && (
+                <span style={{ fontSize: "13px", fontWeight: 600 }}>
+                  {t.quotations.conversion.loading}
+                </span>
+              )}
+              {conversionQuotation && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <strong style={{ fontSize: "13px", color: "var(--brand)" }}>
+                    {t.quotations.conversion.banner.replace(
+                      "{number}",
+                      conversionQuotation.quotationNumber,
+                    )}
+                  </strong>
+                  <span style={{ fontSize: "12px", color: "var(--soft)" }}>
+                    {t.quotations.conversion.lockedHint}
+                  </span>
+                </div>
+              )}
+              {conversionError && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  <strong style={{ fontSize: "13px", color: "var(--accent)" }}>
+                    {conversionError}
+                  </strong>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      navigate(
+                        user?.role === "ADMIN"
+                          ? "/admin/quotations"
+                          : "/sales/quotations",
+                      )
+                    }
+                    style={{
+                      alignSelf: "flex-start",
+                      padding: 0,
+                      border: "none",
+                      background: "none",
+                      color: "var(--brand)",
+                      font: "inherit",
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {t.quotations.backToList}
+                  </button>
+                </div>
+              )}
+            </div>
+          </Card>
+        )}
+
         {/* Customer */}
         <Card style={{ overflow: "visible" }}>
           <label style={cardLabelStyle}>{t.newInvoice.customer}</label>
@@ -467,29 +674,31 @@ export default function NewInvoice() {
                     </button>
                   );
                 })}
-                <button
-                  type="button"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setShowCustomerDropdown(false);
-                    setNewCustomerNameError("");
-                    setShowCreateCustomer(true);
-                  }}
-                  style={{
-                    ...dropdownItemStyle,
-                    fontSize: "13px",
-                    fontWeight: 600,
-                    color: "var(--brand)",
-                    backgroundColor: "transparent",
-                    borderTop: "1px solid var(--border)",
-                    borderRadius: 0,
-                  }}
-                >
-                  {t.newInvoice.createNewCustomer}
-                </button>
               </div>
             )}
           </div>
+          <button
+            type="button"
+            onClick={() => {
+              setShowCustomerDropdown(false);
+              setNewCustomerNameError("");
+              setShowCreateCustomer(true);
+            }}
+            style={{
+              display: "inline-block",
+              marginTop: "8px",
+              border: "none",
+              background: "transparent",
+              padding: 0,
+              fontFamily: FONT_UI,
+              fontSize: "12px",
+              fontWeight: 600,
+              color: "var(--brand)",
+              cursor: "pointer",
+            }}
+          >
+            {t.newInvoice.createNewCustomer}
+          </button>
           {selectedCustomer && (
             <p style={{ fontFamily: FONT_UI, fontSize: "12px", color: "var(--soft)", margin: "6px 0 0" }}>
               {selectedCustomer.type} · {selectedCustomer.phone || t.newInvoice.noPhone}
@@ -544,6 +753,7 @@ export default function NewInvoice() {
                 onChange={(e) => {
                   setSelectedCategoryId(e.target.value);
                   setSelectedModelId("");
+                  setItemPrice("");
                 }}
               />
             </div>
@@ -552,7 +762,12 @@ export default function NewInvoice() {
                 options={modelOptions}
                 placeholder={t.newInvoice.selectModel}
                 value={selectedModelId}
-                onChange={(e) => setSelectedModelId(e.target.value)}
+                onChange={(e) => {
+                  const modelId = e.target.value;
+                  const model = allModels.find((item) => String(item.id) === modelId);
+                  setSelectedModelId(modelId);
+                  setItemPrice(model?.lastPrice ? String(model.lastPrice.price) : "");
+                }}
               />
             </div>
             <div style={{ flex: 1, minWidth: "90px" }}>

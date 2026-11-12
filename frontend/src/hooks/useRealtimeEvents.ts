@@ -31,6 +31,7 @@ export function useRealtimeEvents() {
       queryClient.invalidateQueries({ queryKey: ["notifications"] });
       queryClient.invalidateQueries({ queryKey: ["stock-receipts"] });
       queryClient.invalidateQueries({ queryKey: ["change-requests"] });
+      queryClient.invalidateQueries({ queryKey: ["quotations"] });
       window.dispatchEvent(new CustomEvent<RealtimeEvent>(REALTIME_EVENT, { detail: event }));
     };
 

@@ -12,6 +12,13 @@ import { Input } from "../../components/ui/Input";
 import { Select } from "../../components/ui/Select";
 import { LoadingSpinner } from "../../components/ui/LoadingSpinner";
 import { PageHeader } from "../../components/ui/PageHeader";
+import {
+  calculateInvoiceDiscountFactor,
+  calculateOutstandingInvoiceTotal,
+  getEffectivePrice,
+  getRemainingQuantity,
+  roundMoney,
+} from "../../lib/invoiceTotals";
 import type { Invoice, PaginatedResponse, ProductModel, UnitOfMeasure } from "../../types";
 
 type LineAction = "RETURN_ITEM" | "REMOVE_ITEM" | "CHANGE_PRICE";
@@ -69,7 +76,7 @@ export default function NewChangeRequest() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  const initialType: RequestType = searchParams.get("type") === "RETURN" ? "PARTIAL_RETURN" : "EDIT";
+  const initialType: RequestType = searchParams.get("type") === "RETURN" ? "FULL_RETURN" : "EDIT";
   const [type, setType] = useState<RequestType>(initialType);
   const [reason, setReason] = useState("");
   const [rows, setRows] = useState<ChangeRow[]>([]);
@@ -141,6 +148,72 @@ export default function NewChangeRequest() {
 
   const removeRow = (key: string) => setRows((current) => current.filter((row) => row.key !== key));
 
+  // Server-authoritative rules mirrored for display: latest approved price and
+  // quantity net of approved returns. The backend recomputes on approval.
+  const projected = useMemo(() => {
+    if (!invoice) return null;
+
+    const currentTotal = Number(invoice.currentTotal ?? 0);
+
+    // A full return gives back every remaining unit, so nothing stays owed.
+    if (type === "FULL_RETURN") {
+      return {
+        currentTotal,
+        projectedTotal: 0,
+        delta: roundMoney(-currentTotal),
+      };
+    }
+
+    const discountFactor = calculateInvoiceDiscountFactor(
+      Number(invoice.originalTotal ?? 0),
+      Number(invoice.discountPercentage ?? 0),
+      Number(invoice.discountAmount ?? 0),
+    );
+
+    const outstanding: { price: number; quantity: number }[] = [];
+
+    for (const line of lines) {
+      const soldQuantity = Number(line.quantity ?? 0);
+      let remaining = getRemainingQuantity(line.id, soldQuantity, invoice.returns);
+      let price = getEffectivePrice(line);
+
+      const row = rows.find((candidate) => candidate.kind === "line" && candidate.invoiceItemId === line.id);
+      if (row?.action === "RETURN_ITEM" || row?.action === "REMOVE_ITEM") {
+        if (line.productModel?.isSerialized) {
+          remaining = Math.max(0, remaining - (row.productUnitId ? 1 : 0));
+        } else {
+          const requested = Number(row.quantity);
+          if (Number.isFinite(requested) && requested > 0) {
+            remaining = Math.max(0, roundMoney(remaining - requested));
+          }
+        }
+      }
+      if (row?.action === "CHANGE_PRICE" && row.proposedPrice !== "") {
+        const proposed = Number(row.proposedPrice);
+        if (Number.isFinite(proposed) && proposed >= 0) price = roundMoney(proposed);
+      }
+
+      outstanding.push({ price, quantity: remaining });
+    }
+
+    for (const row of rows) {
+      if (row.kind !== "add" || !row.productModelId) continue;
+      const quantity = Number(row.quantity);
+      const price = Number(row.proposedPrice);
+      if (Number.isFinite(quantity) && quantity > 0 && row.proposedPrice !== "" && Number.isFinite(price) && price >= 0) {
+        outstanding.push({ price: roundMoney(price), quantity });
+      }
+    }
+
+    const { total: projectedTotal } = calculateOutstandingInvoiceTotal(outstanding, discountFactor);
+
+    return {
+      currentTotal,
+      projectedTotal,
+      delta: roundMoney(projectedTotal - currentTotal),
+    };
+  }, [invoice, lines, rows, type]);
+
   const toggleLineAction = (line: ChangeLine, action: string) => {
     setRows((current) => {
       const existing = current.find((row) => row.kind === "line" && row.invoiceItemId === line.id);
@@ -174,7 +247,50 @@ export default function NewChangeRequest() {
       },
     ]);
 
+  /**
+   * A full return always targets every remaining unit on the invoice:
+   * non-serialized lines by quantity, serialized lines by each active unit.
+   */
+  const buildFullReturnItems = (): { items: Record<string, unknown>[]; error?: string } => {
+    const items: Record<string, unknown>[] = [];
+
+    for (const line of lines) {
+      const remaining = getRemainingQuantity(
+        line.id,
+        Number(line.quantity ?? 0),
+        invoice?.returns,
+      );
+      if (remaining <= 0) continue;
+
+      if (line.productModel?.isSerialized) {
+        const units = line.unitAssignments ?? [];
+        if (units.length === 0) {
+          return { items: [], error: t.changeRequestForm.errors.unitRequired };
+        }
+        for (const assignment of units) {
+          items.push({
+            action: "RETURN_ITEM",
+            invoiceItemId: line.id,
+            productUnitId: assignment.productUnitId,
+          });
+        }
+      } else {
+        items.push({
+          action: "RETURN_ITEM",
+          invoiceItemId: line.id,
+          quantity: roundMoney(remaining),
+        });
+      }
+    }
+
+    return { items };
+  };
+
   const buildPayload = (): { items: Record<string, unknown>[]; error?: string } => {
+    if (type === "FULL_RETURN") {
+      return buildFullReturnItems();
+    }
+
     const items: Record<string, unknown>[] = [];
 
     for (const row of rows) {
@@ -184,6 +300,10 @@ export default function NewChangeRequest() {
         const serialized = Boolean(line.productModel?.isSerialized);
 
         if (row.action === "CHANGE_PRICE") {
+          const remaining = getRemainingQuantity(line.id, Number(line.quantity ?? 0), invoice?.returns);
+          if (remaining <= 0) {
+            return { items, error: t.changeRequestForm.errors.fullyReturned };
+          }
           const price = Number(row.proposedPrice);
           if (row.proposedPrice === "" || !Number.isFinite(price) || price < 0) {
             return { items, error: t.changeRequestForm.errors.priceRequired };
@@ -201,7 +321,8 @@ export default function NewChangeRequest() {
           const unit = line.productModel?.unit ?? "PIECE";
           const quantity = Number(row.quantity);
           const normalized = unit === "METER" ? Math.round(quantity * 100) / 100 : quantity;
-          const valid = Number.isFinite(quantity) && normalized > 0 && normalized <= line.quantity &&
+          const remaining = getRemainingQuantity(line.id, Number(line.quantity ?? 0), invoice?.returns);
+          const valid = Number.isFinite(quantity) && normalized > 0 && normalized <= remaining &&
             (unit === "METER" || Number.isInteger(normalized));
           if (!valid) {
             return { items, error: t.changeRequestForm.errors.quantityRequired };
@@ -239,7 +360,7 @@ export default function NewChangeRequest() {
       setError(t.changeRequestForm.errors.reasonRequired);
       return;
     }
-    if (rows.length === 0) {
+    if (rows.length === 0 && type !== "FULL_RETURN") {
       setError(t.changeRequestForm.errors.noChanges);
       return;
     }
@@ -249,7 +370,11 @@ export default function NewChangeRequest() {
       return;
     }
     if (items.length === 0) {
-      setError(t.changeRequestForm.errors.noChanges);
+      setError(
+        type === "FULL_RETURN"
+          ? t.changeRequestForm.errors.nothingToReturn
+          : t.changeRequestForm.errors.noChanges,
+      );
       return;
     }
 
@@ -389,6 +514,70 @@ export default function NewChangeRequest() {
           />
         </div>
 
+        {type === "FULL_RETURN" ? (
+          <div style={cardStyle}>
+            <strong style={{ fontFamily: "'Manrope', sans-serif", fontSize: 14 }}>
+              {t.changeRequestForm.fullReturnTitle}
+            </strong>
+            <small style={{ color: "var(--soft)", fontSize: 12 }}>
+              {t.changeRequestForm.fullReturnHint}
+            </small>
+
+            {lines.map((line) => {
+              const remaining = getRemainingQuantity(
+                line.id,
+                Number(line.quantity ?? 0),
+                invoice.returns,
+              );
+              if (remaining <= 0) return null;
+              const serialized = Boolean(line.productModel?.isSerialized);
+              const units = (line.unitAssignments ?? []).length;
+
+              return (
+                <div
+                  key={line.id}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: 12,
+                    paddingBottom: 10,
+                    borderBottom: "1px solid var(--border-strong)",
+                  }}
+                >
+                  <span style={{ fontSize: 14 }}>
+                    {line.productModel?.name || `#${line.id}`}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 13,
+                      color: "var(--soft)",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {serialized
+                      ? `${units} ${t.changeRequestForm.unit}`
+                      : `${t.changeRequestForm.quantity} ${remaining}`}
+                  </span>
+                </div>
+              );
+            })}
+
+            {lines.every(
+              (line) =>
+                getRemainingQuantity(
+                  line.id,
+                  Number(line.quantity ?? 0),
+                  invoice.returns,
+                ) <= 0,
+            ) && (
+              <small style={{ color: "var(--soft)", fontSize: 13 }}>
+                {t.changeRequestForm.errors.nothingToReturn}
+              </small>
+            )}
+          </div>
+        ) : (
+          <>
         <div style={cardStyle}>
           <strong style={{ fontFamily: "'Manrope', sans-serif", fontSize: 14 }}>
             {t.changeRequestForm.lines}
@@ -397,7 +586,8 @@ export default function NewChangeRequest() {
           {lines.map((line) => {
             const row = rows.find((candidate) => candidate.kind === "line" && candidate.invoiceItemId === line.id);
             const serialized = Boolean(line.productModel?.isSerialized);
-            const currentPrice = line.priceAdjustments?.[line.priceAdjustments.length - 1]?.newPrice ?? line.price;
+            const currentPrice = getEffectivePrice(line);
+            const remaining = getRemainingQuantity(line.id, Number(line.quantity ?? 0), invoice.returns);
             const units = line.unitAssignments ?? [];
 
             return (
@@ -417,7 +607,9 @@ export default function NewChangeRequest() {
                     {line.productModel?.name || `#${line.id}`}
                   </strong>
                   <small style={{ color: "var(--soft)", fontSize: 12 }}>
-                    {t.invoices.qty} {line.quantity} · {t.currency} {money(Number(currentPrice))}
+                    {t.invoices.qty} {line.quantity}
+                    {remaining !== Number(line.quantity ?? 0) ? ` · ${t.changeRequestForm.remaining} ${remaining}` : ""}
+                    {" · "}{t.currency} {money(Number(currentPrice))}
                   </small>
                 </div>
 
@@ -452,10 +644,10 @@ export default function NewChangeRequest() {
                   ) : (
                     <div style={{ flex: "0 1 130px" }}>
                       <Input
-                        label={`${t.changeRequestForm.quantity} (max ${line.quantity})`}
+                        label={`${t.changeRequestForm.quantity} (max ${remaining})`}
                         type="number"
                         min={line.productModel?.unit === "METER" ? 0.01 : 1}
-                        max={line.quantity}
+                        max={remaining}
                         step={line.productModel?.unit === "METER" ? "0.01" : "1"}
                         value={row.quantity}
                         onChange={(event) => setRow(row.key, { quantity: event.target.value })}
@@ -543,6 +735,40 @@ export default function NewChangeRequest() {
               );
             })}
         </div>
+          </>
+        )}
+
+        <div style={{ ...cardStyle, gap: 10 }}>
+          <strong style={{ fontFamily: "'Manrope', sans-serif", fontSize: 14 }}>
+            {t.changeRequestForm.projectedTotals}
+          </strong>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--soft)" }}>
+            <span>{t.changeRequestForm.currentTotal}</span>
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>{t.currency} {money(projected?.currentTotal ?? 0)}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 700 }}>
+            <span>{t.changeRequestForm.projectedTotal}</span>
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>{t.currency} {money(projected?.projectedTotal ?? 0)}</span>
+          </div>
+          {projected && projected.delta !== 0 ? (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: 13,
+                color: projected.delta < 0 ? "var(--accent)" : "var(--mint-ink, var(--ink))",
+              }}
+            >
+              <span>{t.changeRequestForm.projectedDelta}</span>
+              <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                {projected.delta > 0 ? "+" : ""}{money(projected.delta)}
+              </span>
+            </div>
+          ) : null}
+          <small style={{ color: "var(--soft)", fontSize: 12 }}>
+            {t.changeRequestForm.projectedHint}
+          </small>
+        </div>
 
         {error ? (
           <p role="alert" style={{ color: "var(--accent)", margin: 0, fontSize: 13 }}>
@@ -551,7 +777,10 @@ export default function NewChangeRequest() {
         ) : null}
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <Button onClick={handleSubmit} disabled={submitting || rows.length === 0}>
+          <Button
+            onClick={handleSubmit}
+            disabled={submitting || (type !== "FULL_RETURN" && rows.length === 0)}
+          >
             {submitting ? t.changeRequestForm.submitting : t.changeRequestForm.submit}
           </Button>
           <Button variant="secondary" onClick={() => navigate(requestsPath)}>

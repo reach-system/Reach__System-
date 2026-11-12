@@ -6,6 +6,12 @@ interface ExcelExportButtonProps<T extends object> {
   filename: string;
   rows: readonly T[];
   sheetName?: string;
+  /**
+   * Optional full dataset loader for server-paginated reports. When provided,
+   * it is called at export time so the workbook can contain every matching
+   * row rather than only the page currently on screen.
+   */
+  loadRows?: () => Promise<readonly T[]>;
 }
 
 function formatHeader(key: string): string {
@@ -66,14 +72,19 @@ export default function ExcelExportButton<T extends object>({
   filename,
   rows,
   sheetName = "Report",
+  loadRows,
 }: ExcelExportButtonProps<T>) {
   const [exporting, setExporting] = useState(false);
   const { brand } = useSettings();
+  const disabled = exporting || (!loadRows && rows.length === 0);
 
   const exportWorkbook = async () => {
-    if (exporting || rows.length === 0) return;
+    if (disabled) return;
     setExporting(true);
     try {
+      const exportRows = loadRows ? await loadRows() : rows;
+      if (exportRows.length === 0) return;
+
       const workbook = new ExcelJS.Workbook();
       workbook.creator = brand.businessName;
       workbook.created = new Date();
@@ -83,14 +94,14 @@ export default function ExcelExportButton<T extends object>({
         properties: { tabColor: { argb: "FF4169A1" } },
       });
 
-      const keys = Object.keys(rows[0] as Record<string, unknown>);
+      const keys = Object.keys(exportRows[0] as Record<string, unknown>);
       worksheet.columns = keys.map((key) => ({
         header: formatHeader(key),
         key,
         width: Math.max(18, Math.min(36, formatHeader(key).length + 8)),
       }));
 
-      const normalizedRows = rows.map((row) =>
+      const normalizedRows = exportRows.map((row) =>
         keys.reduce<Record<string, unknown>>((result, key) => {
           result[key] = normalizeCellValue((row as Record<string, unknown>)[key]);
           return result;
@@ -193,7 +204,7 @@ export default function ExcelExportButton<T extends object>({
       className="no-print"
       type="button"
       onClick={exportWorkbook}
-      disabled={exporting || rows.length === 0}
+      disabled={disabled}
       style={{
         display: "flex",
         alignItems: "center",
@@ -205,7 +216,7 @@ export default function ExcelExportButton<T extends object>({
         color: "var(--ink)",
         fontWeight: 700,
         cursor: exporting ? "wait" : "pointer",
-        opacity: exporting || rows.length === 0 ? 0.6 : 1,
+        opacity: disabled ? 0.6 : 1,
         boxShadow: "var(--shadow-sm)",
       }}
     >

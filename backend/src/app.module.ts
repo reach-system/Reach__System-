@@ -24,6 +24,7 @@ import { StockItemsModule } from './stock-items/stock-items.module';
 import { WorkplacesModule } from './workplaces/workplaces.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { CustomerDebtsModule } from './customer-debts/customer-debts.module';
+import { QuotationsModule } from './quotations/quotations.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { CustomerDebtsModule } from './customer-debts/customer-debts.module';
     WorkplacesModule,
     RealtimeModule,
     CustomerDebtsModule,
+    QuotationsModule,
     CategoriesModule,
     ProductModelsModule,
     ProductUnitsModule,

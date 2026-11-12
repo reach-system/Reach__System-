@@ -102,6 +102,22 @@ export function getFriendlyErrorMessage(error: unknown, t: TranslationKey, fallb
         : undefined;
 
     if (apiCode) {
+      // Stock shortages carry the product and the available/requested counts so
+      // the user can see exactly what is missing (used by invoice creation and
+      // quotation conversion).
+      if (apiCode === 'INSUFFICIENT_STOCK') {
+        const productName = payload.productName;
+        if (typeof productName === 'string' && productName.trim()) {
+          return fillTemplate(t.errors.quotation.INSUFFICIENT_STOCK_DETAIL, payload);
+        }
+      }
+
+      const quotationMessages = t.errors.quotation as unknown as Record<string, string>;
+      const quotationTemplate = quotationMessages[apiCode];
+      if (quotationTemplate) {
+        return fillTemplate(quotationTemplate, payload);
+      }
+
       const deliveryMessages = t.errors.delivery as unknown as Record<string, string>;
       const deliveryTemplate = deliveryMessages[apiCode];
       if (deliveryTemplate) {
